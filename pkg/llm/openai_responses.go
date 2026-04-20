@@ -121,7 +121,11 @@ func (o *openaiResponsesText) String(ctx context.Context, messages []string) (va
 	if err != nil {
 		return "", errors.Wrap(err, "do request")
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -129,49 +133,9 @@ func (o *openaiResponsesText) String(ctx context.Context, messages []string) (va
 		return "", errors.Errorf("responses API error %d: %s", resp.StatusCode, body)
 	}
 
-	var (
-		fullText  string
-		usage     responsesUsage
-		eventType string
-	)
-
-	scanner := bufio.NewScanner(resp.Body)
-	for scanner.Scan() {
-		line := scanner.Text()
-
-		switch {
-		case strings.HasPrefix(line, "event: "):
-			eventType = strings.TrimPrefix(line, "event: ")
-
-		case strings.HasPrefix(line, "data: "):
-			data := strings.TrimPrefix(line, "data: ")
-
-			switch eventType {
-			case "response.output_text.done":
-				var ev struct {
-					Text string `json:"text"`
-				}
-				if json.Unmarshal([]byte(data), &ev) == nil {
-					fullText = ev.Text
-				}
-
-			case "response.completed":
-				var ev struct {
-					Response struct {
-						Usage responsesUsage `json:"usage"`
-					} `json:"response"`
-				}
-				if json.Unmarshal([]byte(data), &ev) == nil {
-					usage = ev.Response.Usage
-				}
-			}
-		}
-	}
-	if err = scanner.Err(); err != nil {
-		return "", errors.Wrap(err, "read SSE stream")
-	}
-	if fullText == "" {
-		return "", errors.New("no text content in responses stream")
+	fullText, usage, err := parseResponsesSSE(resp.Body)
+	if err != nil {
+		return "", err
 	}
 
 	lvs := []string{o.Name(), o.Instance(), "String"}
@@ -180,6 +144,61 @@ func (o *openaiResponsesText) String(ctx context.Context, messages []string) (va
 	totalTokens.WithLabelValues(lvs...).Add(float64(usage.TotalTokens))
 
 	return fullText, nil
+}
+
+func parseResponsesSSE(body io.Reader) (string, responsesUsage, error) {
+	var (
+		fullText  string
+		usage     responsesUsage
+		eventType string
+	)
+
+	scanner := bufio.NewScanner(body)
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		if strings.HasPrefix(line, "event: ") {
+			eventType = strings.TrimPrefix(line, "event: ")
+
+			continue
+		}
+
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+
+		data := strings.TrimPrefix(line, "data: ")
+
+		switch eventType {
+		case "response.output_text.done":
+			var ev struct {
+				Text string `json:"text"`
+			}
+			if json.Unmarshal([]byte(data), &ev) == nil {
+				fullText = ev.Text
+			}
+
+		case "response.completed":
+			var ev struct {
+				Response struct {
+					Usage responsesUsage `json:"usage"`
+				} `json:"response"`
+			}
+			if json.Unmarshal([]byte(data), &ev) == nil {
+				usage = ev.Response.Usage
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return "", responsesUsage{}, errors.Wrap(err, "read SSE stream")
+	}
+
+	if fullText == "" {
+		return "", responsesUsage{}, errors.New("no text content in responses stream")
+	}
+
+	return fullText, usage, nil
 }
 
 func (o *openaiResponsesText) EmbeddingLabels(ctx context.Context, labels model.Labels) (value [][]float32, err error) {
