@@ -76,21 +76,23 @@ type Config struct {
 type ProviderType string
 
 const (
-	ProviderTypeOpenAI      ProviderType = "openai"
-	ProviderTypeOpenRouter  ProviderType = "openrouter"
-	ProviderTypeDeepSeek    ProviderType = "deepseek"
-	ProviderTypeGemini      ProviderType = "gemini"
-	ProviderTypeVolc        ProviderType = "volc" // Rename MaaS to ARK. 😄
-	ProviderTypeSiliconFlow ProviderType = "siliconflow"
+	ProviderTypeOpenAI          ProviderType = "openai"
+	ProviderTypeOpenAIResponses ProviderType = "openai-responses"
+	ProviderTypeOpenRouter      ProviderType = "openrouter"
+	ProviderTypeDeepSeek        ProviderType = "deepseek"
+	ProviderTypeGemini          ProviderType = "gemini"
+	ProviderTypeVolc            ProviderType = "volc" // Rename MaaS to ARK. 😄
+	ProviderTypeSiliconFlow     ProviderType = "siliconflow"
 )
 
 var defaultEndpoints = map[ProviderType]string{
-	ProviderTypeOpenAI:      "https://api.openai.com/v1",
-	ProviderTypeOpenRouter:  "https://openrouter.ai/api/v1",
-	ProviderTypeDeepSeek:    "https://api.deepseek.com/v1",
-	ProviderTypeGemini:      "https://generativelanguage.googleapis.com/v1beta",
-	ProviderTypeVolc:        "https://ark.cn-beijing.volces.com/api/v3",
-	ProviderTypeSiliconFlow: "https://api.siliconflow.cn/v1",
+	ProviderTypeOpenAI:          "https://api.openai.com/v1",
+	ProviderTypeOpenAIResponses: "https://api.openai.com/v1",
+	ProviderTypeOpenRouter:      "https://openrouter.ai/api/v1",
+	ProviderTypeDeepSeek:        "https://api.deepseek.com/v1",
+	ProviderTypeGemini:          "https://generativelanguage.googleapis.com/v1beta",
+	ProviderTypeVolc:            "https://ark.cn-beijing.volces.com/api/v3",
+	ProviderTypeSiliconFlow:     "https://api.siliconflow.cn/v1",
 }
 
 func (c *Config) Validate() error { //nolint:cyclop
@@ -101,7 +103,7 @@ func (c *Config) Validate() error { //nolint:cyclop
 	switch c.Provider {
 	case "":
 		c.Provider = ProviderTypeOpenAI
-	case ProviderTypeOpenAI, ProviderTypeOpenRouter, ProviderTypeDeepSeek,
+	case ProviderTypeOpenAI, ProviderTypeOpenAIResponses, ProviderTypeOpenRouter, ProviderTypeDeepSeek,
 		ProviderTypeGemini, ProviderTypeVolc, ProviderTypeSiliconFlow:
 	default:
 		return errors.Errorf("invalid provider: %s", c.Provider)
@@ -331,6 +333,9 @@ func (f *factory) new(c *Config) LLM {
 	switch c.Provider {
 	case ProviderTypeOpenAI, ProviderTypeOpenRouter, ProviderTypeDeepSeek, ProviderTypeVolc, ProviderTypeSiliconFlow: //nolint:lll
 		return newCached(newOpenAI(c), f.Dependencies().KVStorage)
+
+	case ProviderTypeOpenAIResponses:
+		return newCached(newOpenAIResponses(c), f.Dependencies().KVStorage)
 
 	case ProviderTypeGemini:
 		return newCached(newGemini(c), f.Dependencies().KVStorage)
