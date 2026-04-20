@@ -414,6 +414,9 @@ func (c *cached) String(ctx context.Context, messages []string) (string, error) 
 		return "", err
 	}
 	if strings.Trim(value, " \n\r\t") == "" {
+		log.Error(ctx, errors.New("empty response"), "LLM returned empty content",
+			"messages_count", len(messages))
+
 		return "", errors.New("empty response") // Gemini may occur this.
 	}
 

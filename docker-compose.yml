@@ -58,7 +58,7 @@ configs:
       llms:
         - name: general
           default: true
-          provider: openai
+          provider: openai-responses
           endpoint: ${API_ENDPOINT:-your-api-endpoint}
           model: gpt-5.4
           api_key: ${C_API_KEY:-your-chat-api-key}
