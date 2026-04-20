@@ -1,10 +1,10 @@
 ## 0. Check your current version
 ```bash
 # Mac/Linux
-docker inspect ghcr.io/bustesoul/zenfeed:latest | grep version
+docker inspect ghcr.io/bustesoul/zenfeed:dev | grep version
 
 # Windows PowerShell
-docker inspect ghcr.io/bustesoul/zenfeed:latest | Select-String -Pattern 'version'
+docker inspect ghcr.io/bustesoul/zenfeed:dev | Select-String -Pattern 'version'
 ```
 
 If you **don't see any results**, it means you're using version v0.1.0. This is because the first version didn't include version information. Therefore, **this document applies to you.**

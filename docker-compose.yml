@@ -1,6 +1,6 @@
 services:
   zenfeed-web:
-    image: ghcr.io/bustesoul/zenfeed-web:latest
+    image: ghcr.io/bustesoul/zenfeed-web:dev
     ports:
       - "1400:1400"
     environment:
@@ -10,7 +10,7 @@ services:
     restart: unless-stopped
 
   zenfeed:
-    image: ghcr.io/bustesoul/zenfeed:latest
+    image: ghcr.io/bustesoul/zenfeed:dev
     entrypoint: >
       sh -c "
       if [ ! -f /app/config/config.yaml ]; then
