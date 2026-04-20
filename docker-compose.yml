@@ -1,6 +1,6 @@
 services:
   zenfeed-web:
-    image: glidea/zenfeed-web:latest
+    image: ghcr.io/bustesoul/zenfeed-web:latest
     ports:
       - "1400:1400"
     environment:
@@ -10,7 +10,7 @@ services:
     restart: unless-stopped
 
   zenfeed:
-    image: glidea/zenfeed:latest
+    image: ghcr.io/bustesoul/zenfeed:latest
     entrypoint: >
       sh -c "
       if [ ! -f /app/config/config.yaml ]; then

@@ -1,6 +1,6 @@
 VERSION ?= $(shell git describe --tags --always)
 IMAGE_NAME ?= zenfeed
-REGISTRY ?= glidea
+REGISTRY ?= ghcr.io/bustesoul
 FULL_IMAGE_NAME = $(REGISTRY)/$(IMAGE_NAME)
 
 
