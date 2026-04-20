@@ -5,6 +5,8 @@ services:
       - "1400:1400"
     environment:
       - PUBLIC_DEFAULT_API_URL=http://zenfeed:1300
+      - AUTH_USERNAME=${AUTH_USERNAME:-}
+      - AUTH_PASSWORD=${AUTH_PASSWORD:-}
     depends_on:
       - zenfeed
     restart: unless-stopped
@@ -32,6 +34,9 @@ services:
       - "1300:1300"
       - "1301:1301"
       - "9090:9090"
+    environment:
+      - AUTH_USERNAME=${AUTH_USERNAME:-}
+      - AUTH_PASSWORD=${AUTH_PASSWORD:-}
     depends_on:
       - rsshub
     restart: unless-stopped

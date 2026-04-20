@@ -86,16 +86,19 @@ func new(instance string, app *config.App, dependencies Dependencies) (Server, e
 		return nil, errors.Wrap(err, "validate config")
 	}
 
-	router := http.NewServeMux()
+	authToken := loadAuthToken()
+	protected := http.NewServeMux()
 	api := dependencies.API
-	router.Handle("/write", jsonrpc.API(api.Write))
-	router.Handle("/query_config", jsonrpc.API(api.QueryAppConfig))
-	router.Handle("/apply_config", jsonrpc.API(api.ApplyAppConfig))
-	router.Handle("/query_config_schema", jsonrpc.API(api.QueryAppConfigSchema))
-	router.Handle("/query_rsshub_categories", jsonrpc.API(api.QueryRSSHubCategories))
-	router.Handle("/query_rsshub_websites", jsonrpc.API(api.QueryRSSHubWebsites))
-	router.Handle("/query_rsshub_routes", jsonrpc.API(api.QueryRSSHubRoutes))
-	router.Handle("/query", jsonrpc.API(api.Query))
+	protected.Handle("/write", jsonrpc.API(api.Write))
+	protected.Handle("/query_config", jsonrpc.API(api.QueryAppConfig))
+	protected.Handle("/apply_config", jsonrpc.API(api.ApplyAppConfig))
+	protected.Handle("/query_config_schema", jsonrpc.API(api.QueryAppConfigSchema))
+	protected.Handle("/query_rsshub_categories", jsonrpc.API(api.QueryRSSHubCategories))
+	protected.Handle("/query_rsshub_websites", jsonrpc.API(api.QueryRSSHubWebsites))
+	protected.Handle("/query_rsshub_routes", jsonrpc.API(api.QueryRSSHubRoutes))
+	protected.Handle("/query", jsonrpc.API(api.Query))
+	router := http.NewServeMux()
+	router.Handle("/", authMiddleware(authToken, protected))
 	httpServer := &http.Server{Addr: config.Address, Handler: router}
 
 	return &server{
