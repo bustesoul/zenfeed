@@ -16,6 +16,7 @@
 package llm
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -76,29 +77,12 @@ type openaiResponsesText struct {
 }
 
 type responsesRequest struct {
-	Model string             `json:"model"`
-	Input []responsesMessage `json:"input"`
+	Model  string `json:"model"`
+	Input  string `json:"input"`
+	Stream bool   `json:"stream"`
 }
 
-type responsesMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
-type responsesResponse struct {
-	Output []responsesOutput `json:"output"`
-	Usage  responsesUsage    `json:"usage"`
-}
-
-type responsesOutput struct {
-	Type    string             `json:"type"`
-	Content []responsesContent `json:"content"`
-}
-
-type responsesContent struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
-}
+// responsesMessage and old struct types are replaced by string input above.
 
 type responsesUsage struct {
 	InputTokens  int `json:"input_tokens"`
@@ -115,12 +99,11 @@ func (o *openaiResponsesText) String(ctx context.Context, messages []string) (va
 		return "", errors.New("model is not set")
 	}
 
-	input := make([]responsesMessage, 0, len(messages))
-	for _, m := range messages {
-		input = append(input, responsesMessage{Role: "user", Content: m})
-	}
-
-	bodyBytes, err := json.Marshal(responsesRequest{Model: config.Model, Input: input})
+	bodyBytes, err := json.Marshal(responsesRequest{
+		Model:  config.Model,
+		Input:  strings.Join(messages, "\n"),
+		Stream: true,
+	})
 	if err != nil {
 		return "", errors.Wrap(err, "marshal request")
 	}
@@ -132,6 +115,7 @@ func (o *openaiResponsesText) String(ctx context.Context, messages []string) (va
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+o.apiKey)
+	req.Header.Set("Accept", "text/event-stream")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -145,28 +129,57 @@ func (o *openaiResponsesText) String(ctx context.Context, messages []string) (va
 		return "", errors.Errorf("responses API error %d: %s", resp.StatusCode, body)
 	}
 
-	var result responsesResponse
-	if err = json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", errors.Wrap(err, "decode response")
-	}
+	var (
+		fullText  string
+		usage     responsesUsage
+		eventType string
+	)
 
-	for _, out := range result.Output {
-		if out.Type != "message" {
-			continue
-		}
-		for _, content := range out.Content {
-			if content.Type == "output_text" && content.Text != "" {
-				lvs := []string{o.Name(), o.Instance(), "String"}
-				promptTokens.WithLabelValues(lvs...).Add(float64(result.Usage.InputTokens))
-				completionTokens.WithLabelValues(lvs...).Add(float64(result.Usage.OutputTokens))
-				totalTokens.WithLabelValues(lvs...).Add(float64(result.Usage.TotalTokens))
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		line := scanner.Text()
 
-				return content.Text, nil
+		switch {
+		case strings.HasPrefix(line, "event: "):
+			eventType = strings.TrimPrefix(line, "event: ")
+
+		case strings.HasPrefix(line, "data: "):
+			data := strings.TrimPrefix(line, "data: ")
+
+			switch eventType {
+			case "response.output_text.done":
+				var ev struct {
+					Text string `json:"text"`
+				}
+				if json.Unmarshal([]byte(data), &ev) == nil {
+					fullText = ev.Text
+				}
+
+			case "response.completed":
+				var ev struct {
+					Response struct {
+						Usage responsesUsage `json:"usage"`
+					} `json:"response"`
+				}
+				if json.Unmarshal([]byte(data), &ev) == nil {
+					usage = ev.Response.Usage
+				}
 			}
 		}
 	}
+	if err = scanner.Err(); err != nil {
+		return "", errors.Wrap(err, "read SSE stream")
+	}
+	if fullText == "" {
+		return "", errors.New("no text content in responses stream")
+	}
 
-	return "", errors.New("no text content in responses output")
+	lvs := []string{o.Name(), o.Instance(), "String"}
+	promptTokens.WithLabelValues(lvs...).Add(float64(usage.InputTokens))
+	completionTokens.WithLabelValues(lvs...).Add(float64(usage.OutputTokens))
+	totalTokens.WithLabelValues(lvs...).Add(float64(usage.TotalTokens))
+
+	return fullText, nil
 }
 
 func (o *openaiResponsesText) EmbeddingLabels(ctx context.Context, labels model.Labels) (value [][]float32, err error) {
