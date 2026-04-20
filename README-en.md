@@ -181,35 +181,7 @@ We have some cool features planned. Check out our [Roadmap](/docs/roadmap-en.md)
 
 > **For usage questions, please prioritize opening an [Issue](https://github.com/glidea/zenfeed/issues).** This helps others with similar problems and allows for better tracking and resolution.
 
-<table>
-  <tr>
-    <td align="center">
-      <img src="docs/images/wechat.png" alt="Wechat QR Code" width="150">
-      <br>
-      <strong>Join WeChat Group</strong>
-    </td>
-    <td align="center">
-      <img src="docs/images/sponsor.png" alt="Sponsor QR Code" width="150">
-      <br>
-      <strong>Buy Me a Coffee 🧋</strong>
-    </td>
-  </tr>
-</table>
-
 Since you've read this far, how about giving us a **Star ⭐️**? It's the biggest motivation for me to keep maintaining this project!
-
-If you have any interesting AI job opportunities, please contact me!
-
----
-
-## 🧩 Ecosystem Projects
-
-### [Ruhang365 Daily](https://daily.ruhang365.com)
-Founded in 2017, Ruhang365 aims to build a community for sharing expertise and growing together, starting with industry information exchange. It is dedicated to providing comprehensive career consulting, training, niche community interactions, and resource collaboration services for internet professionals.
-
-*Experimental Content Sources (Updates Paused)*
-*   [V2EX](https://v2ex.analysis.zenfeed.xyz/)
-*   [LinuxDO](https://linuxdo.analysis.zenfeed.xyz/)
 
 ---
 
