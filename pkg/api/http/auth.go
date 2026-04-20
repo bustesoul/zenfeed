@@ -35,10 +35,12 @@ func loadAuthToken() string {
 	if username == "" || password == "" {
 		b := make([]byte, 32)
 		rand.Read(b) //nolint:errcheck
+
 		return hex.EncodeToString(b)
 	}
 	h := sha256.New()
 	h.Write([]byte(username + ":" + password))
+
 	return hex.EncodeToString(h.Sum(nil))
 }
 
@@ -46,6 +48,7 @@ func loginHandler(token string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+
 			return
 		}
 		var creds struct {
@@ -54,6 +57,7 @@ func loginHandler(token string) http.Handler {
 		}
 		if err := json.NewDecoder(r.Body).Decode(&creds); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
+
 			return
 		}
 		username := os.Getenv("AUTH_USERNAME")
@@ -62,6 +66,7 @@ func loginHandler(token string) http.Handler {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
 			_, _ = w.Write([]byte(`{"error":"invalid credentials"}`))
+
 			return
 		}
 		http.SetCookie(w, &http.Cookie{
@@ -98,6 +103,7 @@ func authMiddleware(token string, next http.Handler) http.Handler {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
 			_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
+
 			return
 		}
 		next.ServeHTTP(w, r)
