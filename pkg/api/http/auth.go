@@ -19,6 +19,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"net/http"
 	"os"
 )
@@ -39,6 +40,55 @@ func loadAuthToken() string {
 	h := sha256.New()
 	h.Write([]byte(username + ":" + password))
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+func loginHandler(token string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var creds struct {
+			Username string `json:"username"`
+			Password string `json:"password"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&creds); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		username := os.Getenv("AUTH_USERNAME")
+		password := os.Getenv("AUTH_PASSWORD")
+		if username == "" || password == "" || creds.Username != username || creds.Password != password {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":"invalid credentials"}`))
+			return
+		}
+		http.SetCookie(w, &http.Cookie{
+			Name:     cookieName,
+			Value:    token,
+			Path:     "/",
+			MaxAge:   cookieMaxAge,
+			HttpOnly: true,
+			SameSite: http.SameSiteLaxMode,
+		})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})
+}
+
+func logoutHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.SetCookie(w, &http.Cookie{
+			Name:     cookieName,
+			Value:    "",
+			Path:     "/",
+			MaxAge:   -1,
+			HttpOnly: true,
+		})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})
 }
 
 func authMiddleware(token string, next http.Handler) http.Handler {

@@ -98,6 +98,8 @@ func new(instance string, app *config.App, dependencies Dependencies) (Server, e
 	protected.Handle("/query_rsshub_routes", jsonrpc.API(api.QueryRSSHubRoutes))
 	protected.Handle("/query", jsonrpc.API(api.Query))
 	router := http.NewServeMux()
+	router.Handle("/auth/login", loginHandler(authToken))
+	router.Handle("/auth/logout", logoutHandler())
 	router.Handle("/", authMiddleware(authToken, protected))
 	httpServer := &http.Server{Addr: config.Address, Handler: router}
 

@@ -5,8 +5,6 @@ services:
       - "1400:1400"
     environment:
       - PUBLIC_DEFAULT_API_URL=http://zenfeed:1300
-      - AUTH_USERNAME=${AUTH_USERNAME:-}
-      - AUTH_PASSWORD=${AUTH_PASSWORD:-}
     depends_on:
       - zenfeed
     restart: unless-stopped
@@ -40,7 +38,7 @@ services:
     depends_on:
       - rsshub
     restart: unless-stopped
-    
+
   rsshub:
     image: diygod/rsshub:2024-12-14
     ports:
@@ -48,7 +46,7 @@ services:
     environment:
       - NODE_ENV=production
     restart: unless-stopped
-      
+
 volumes:
   data: {}
   config: {}
@@ -60,13 +58,14 @@ configs:
       llms:
         - name: general
           default: true
-          provider: siliconflow
-          model: Qwen/Qwen3-8B
-          api_key: ${API_KEY:-your-api-key}
+          provider: openai
+          endpoint: ${API_ENDPOINT:-your-api-endpoint}
+          model: gpt-5.4
+          api_key: ${C_API_KEY:-your-chat-api-key}
         - name: embed
           provider: siliconflow
           embedding_model: Qwen/Qwen3-Embedding-4B
-          api_key: ${API_KEY:-your-api-key}
+          api_key: ${E_API_KEY:-your_embed-api-key}
       scrape:
         rsshub_endpoint: http://rsshub:1200
       storage:
