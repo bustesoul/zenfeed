@@ -63,26 +63,30 @@ func (c *Config) Validate() error {
 }
 
 func (c *Config) From(app *config.App) {
-	c.Scrapers = make([]scraper.Config, len(app.Scrape.Sources))
+	c.Scrapers = make([]scraper.Config, 0, len(app.Scrape.Sources))
 	for i := range app.Scrape.Sources {
-		c.Scrapers[i] = scraper.Config{
+		if app.Scrape.Sources[i].Disabled {
+			continue
+		}
+		sc := scraper.Config{
 			Past:     time.Duration(app.Scrape.Past),
 			Name:     app.Scrape.Sources[i].Name,
 			Interval: time.Duration(app.Scrape.Sources[i].Interval),
 			Labels:   model.Labels{},
 		}
-		c.Scrapers[i].Labels.FromMap(app.Scrape.Sources[i].Labels)
-		if c.Scrapers[i].Interval <= 0 {
-			c.Scrapers[i].Interval = time.Duration(app.Scrape.Interval)
+		sc.Labels.FromMap(app.Scrape.Sources[i].Labels)
+		if sc.Interval <= 0 {
+			sc.Interval = time.Duration(app.Scrape.Interval)
 		}
 		if app.Scrape.Sources[i].RSS != nil {
-			c.Scrapers[i].RSS = &scraper.ScrapeSourceRSS{
+			sc.RSS = &scraper.ScrapeSourceRSS{
 				URL:             app.Scrape.Sources[i].RSS.URL,
 				RSSHubEndpoint:  app.Scrape.RSSHubEndpoint,
 				RSSHubRoutePath: app.Scrape.Sources[i].RSS.RSSHubRoutePath,
 				RSSHubAccessKey: app.Scrape.RSSHubAccessKey,
 			}
 		}
+		c.Scrapers = append(c.Scrapers, sc)
 	}
 }
 

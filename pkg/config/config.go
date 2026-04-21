@@ -125,6 +125,7 @@ type ObjectStorage struct {
 }
 
 type ScrapeSource struct {
+	Disabled bool              `yaml:"disabled,omitempty" json:"disabled,omitempty" desc:"If true, this source is disabled and will not be scraped."`
 	Interval timeutil.Duration `yaml:"interval,omitempty" json:"interval,omitempty" desc:"How often to scrape this source. Default: global interval"`
 	Name     string            `yaml:"name,omitempty" json:"name,omitempty" desc:"The name of the source. It is required."`
 	Labels   map[string]string `yaml:"labels,omitempty" json:"labels,omitempty" desc:"The additional labels to add to the feed of this source."`
