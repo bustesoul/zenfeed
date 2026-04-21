@@ -58,6 +58,9 @@ type Storage interface {
 	// Results are sorted by score (if vector query) and time.
 	Query(ctx context.Context, query block.QueryOptions) ([]*block.FeedVO, error)
 
+	// Get retrieves a single feed by its stable ID.
+	Get(ctx context.Context, id uint64, hintTime time.Time) (*block.FeedVO, bool, error)
+
 	// Exists checks if a feed exists in the storage.
 	// If hintTime is zero, it only checks the head block.
 	Exists(ctx context.Context, id uint64, hintTime time.Time) (bool, error)
@@ -436,6 +439,36 @@ func (s *storage) Query(ctx context.Context, query block.QueryOptions) (feeds []
 	return feedHeap.Slice(), nil
 }
 
+func (s *storage) Get(ctx context.Context, id uint64, hintTime time.Time) (*block.FeedVO, bool, error) {
+	if !hintTime.IsZero() {
+		b, ok := s.blocks.get(hintTime)
+		if ok {
+			feed, found, err := b.Get(ctx, id)
+			if err != nil {
+				return nil, false, err
+			}
+			if found {
+				return feed, true, nil
+			}
+		}
+	}
+
+	for _, b := range s.blocks.list(nil) {
+		if !hintTime.IsZero() && timeutil.InRange(hintTime, b.Start(), b.End()) {
+			continue
+		}
+		feed, found, err := b.Get(ctx, id)
+		if err != nil {
+			return nil, false, err
+		}
+		if found {
+			return feed, true, nil
+		}
+	}
+
+	return nil, false, nil
+}
+
 func (s *storage) Exists(ctx context.Context, id uint64, hintTime time.Time) (bool, error) {
 	// Normal path.
 	if !hintTime.IsZero() {
@@ -645,6 +678,17 @@ func (m *mockStorage) Query(ctx context.Context, query block.QueryOptions) ([]*b
 	args := m.Called(ctx, query)
 
 	return args.Get(0).([]*block.FeedVO), args.Error(1)
+}
+
+func (m *mockStorage) Get(ctx context.Context, id uint64, hintTime time.Time) (*block.FeedVO, bool, error) {
+	args := m.Called(ctx, id, hintTime)
+
+	var feedVO *block.FeedVO
+	if value := args.Get(0); value != nil {
+		feedVO = value.(*block.FeedVO)
+	}
+
+	return feedVO, args.Bool(1), args.Error(2)
 }
 
 func (m *mockStorage) Exists(ctx context.Context, id uint64, hintTime time.Time) (bool, error) {

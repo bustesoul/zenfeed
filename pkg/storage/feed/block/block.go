@@ -68,6 +68,7 @@ type Block interface {
 
 	Append(ctx context.Context, feeds ...*model.Feed) error
 	Query(ctx context.Context, query QueryOptions) ([]*FeedVO, error)
+	Get(ctx context.Context, id uint64) (*FeedVO, bool, error)
 	Exists(ctx context.Context, id uint64) (bool, error)
 }
 
@@ -257,7 +258,7 @@ const (
 type FeedVO struct {
 	*model.Feed        `json:",inline"`
 	Vectors            [][]float32 `json:"-"`
-	Score              float32     `json:"score,omitempty"`              // Only exists when SemanticFilter is set.
+	Score              float32     `json:"score,omitempty"`               // Only exists when SemanticFilter is set.
 	MatchedPreferences []string    `json:"matched_preferences,omitempty"` // Tags that matched user preferences.
 }
 
@@ -698,6 +699,38 @@ func (b *block) Query(ctx context.Context, query QueryOptions) (feeds []*FeedVO,
 	}
 
 	return result.Slice(), nil
+}
+
+func (b *block) Get(ctx context.Context, id uint64) (feedVO *FeedVO, ok bool, err error) {
+	ctx = telemetry.StartWith(ctx, append(b.TelemetryLabels(), telemetrymodel.KeyOperation, "Get")...)
+	defer func() { telemetry.End(ctx, err) }()
+	b.lastDataAccess.Store(clk.Now())
+
+	if err := b.ensureLoaded(ctx); err != nil {
+		return nil, false, errors.Wrap(err, "ensuring block loaded")
+	}
+
+	ref, ok := b.primaryIndex.Search(ctx, id)
+	if !ok {
+		return nil, false, nil
+	}
+
+	b.mu.RLock()
+	ck := b.chunks[ref.Chunk]
+	b.mu.RUnlock()
+	if ck == nil {
+		return nil, false, errors.Errorf("chunk file not found, data may be corrupted: %d", ref.Chunk)
+	}
+
+	feed, err := ck.Read(ctx, ref.Offset)
+	if err != nil {
+		return nil, false, errors.Wrapf(err, "reading chunk file: %d", ref.Chunk)
+	}
+
+	return &FeedVO{
+		Feed:    feed.Feed,
+		Vectors: feed.Vectors,
+	}, true, nil
 }
 
 func (b *block) Exists(ctx context.Context, id uint64) (exists bool, err error) {
@@ -1446,6 +1479,17 @@ func (m *mockBlock) Query(ctx context.Context, query QueryOptions) ([]*FeedVO, e
 	args := m.Called(ctx, query)
 
 	return args.Get(0).([]*FeedVO), args.Error(1)
+}
+
+func (m *mockBlock) Get(ctx context.Context, id uint64) (*FeedVO, bool, error) {
+	args := m.Called(ctx, id)
+
+	var feedVO *FeedVO
+	if value := args.Get(0); value != nil {
+		feedVO = value.(*FeedVO)
+	}
+
+	return feedVO, args.Bool(1), args.Error(2)
 }
 
 func (m *mockBlock) Exists(ctx context.Context, id uint64) (bool, error) {

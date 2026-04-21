@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/pkg/errors"
@@ -30,9 +31,9 @@ import (
 )
 
 // KV key patterns (single-user self-hosted, no user: prefix).
-func FeedbackKey(feedID string) []byte { return []byte("feedback:" + feedID) }
-func ArchiveKey(feedID string) []byte  { return []byte("archive:" + feedID) }
-func ReadKey(feedID string) []byte     { return []byte("read:" + feedID) }
+func FeedbackKey(feedID string) []byte { return namespacedKey("feedback", 0, feedID) }
+func ArchiveKey(feedID string) []byte  { return namespacedKey("archive", 0, feedID) }
+func ReadKey(feedID string) []byte     { return namespacedKey("read", 0, feedID) }
 
 const ProfileGlobalKey = "profile:global"
 
@@ -52,14 +53,24 @@ type UserTag struct {
 	Action TagAction `json:"action"`
 }
 
+// AppliedTagSignal is the normalized signal actually written into the profile.
+// It is derived from explicit user controls plus score-based article signals.
+type AppliedTagSignal struct {
+	Tag    string    `json:"tag"`
+	Action TagAction `json:"action"`
+	Delta  float64   `json:"delta"`
+}
+
 // Feedback is per-article raw user feedback stored at feedback:{feed_id}.
 type Feedback struct {
-	FeedID      string    `json:"feed_id"`
-	Score       int       `json:"score,omitempty"`
-	ScoreReason string    `json:"score_reason,omitempty"`
-	Tags        []UserTag `json:"tags,omitempty"`
-	Archive     bool      `json:"archive,omitempty"`
-	CreatedAt   time.Time `json:"created_at"`
+	FeedID         string             `json:"feed_id"`
+	Score          int                `json:"score,omitempty"`
+	ScoreReason    string             `json:"score_reason,omitempty"`
+	Tags           []UserTag          `json:"tags,omitempty"`
+	AppliedSignals []AppliedTagSignal `json:"applied_signals,omitempty"`
+	Note           string             `json:"note,omitempty"`
+	Archive        bool               `json:"archive,omitempty"`
+	CreatedAt      time.Time          `json:"created_at"`
 }
 
 // TagControl is an aggregated tag preference in the profile.
@@ -78,13 +89,21 @@ type ArchiveIndexEntry struct {
 	ArchivedAt time.Time `json:"archived_at"`
 }
 
+// ReadIndexEntry is a lightweight record of a read article stored inside profile:global.
+type ReadIndexEntry struct {
+	FeedID string    `json:"feed_id"`
+	ReadAt time.Time `json:"read_at"`
+}
+
 // ProfileGlobal is the aggregated user preference profile stored at profile:global.
 type ProfileGlobal struct {
+	NamespaceVersion int                 `json:"namespace_version,omitempty"`
 	TagControls      []TagControl        `json:"tag_controls"`
 	FeedbackCount    int                 `json:"feedback_count"`
 	LastUpdated      time.Time           `json:"last_updated"`
 	WeeklySnapshot   []TagControl        `json:"weekly_snapshot,omitempty"`
 	WeeklySnapshotAt time.Time           `json:"weekly_snapshot_at,omitempty"`
+	ReadIndex        []ReadIndexEntry    `json:"read_index,omitempty"`
 	ArchiveIndex     []ArchiveIndexEntry `json:"archive_index,omitempty"`
 }
 
@@ -113,13 +132,24 @@ func NewStore(kv kv.Storage) *Store {
 }
 
 func (s *Store) SaveFeedback(ctx context.Context, fb *Feedback) error {
-	fb.CreatedAt = time.Now()
+	profile, err := s.GetProfile(ctx)
+	if err != nil {
+		return errors.Wrap(err, "get profile for feedback")
+	}
+
+	return s.saveFeedbackWithNamespace(ctx, profile.NamespaceVersion, fb)
+}
+
+func (s *Store) saveFeedbackWithNamespace(ctx context.Context, namespace int, fb *Feedback) error {
+	if fb.CreatedAt.IsZero() {
+		fb.CreatedAt = time.Now()
+	}
 	data, err := json.Marshal(fb)
 	if err != nil {
 		return errors.Wrap(err, "marshal feedback")
 	}
 
-	if err := s.kv.Set(ctx, FeedbackKey(fb.FeedID), data, 0); err != nil {
+	if err := s.kv.Set(ctx, feedbackKey(namespace, fb.FeedID), data, 0); err != nil {
 		return errors.Wrap(err, "set feedback")
 	}
 
@@ -127,7 +157,12 @@ func (s *Store) SaveFeedback(ctx context.Context, fb *Feedback) error {
 }
 
 func (s *Store) GetFeedback(ctx context.Context, feedID string) (*Feedback, error) {
-	data, err := s.kv.Get(ctx, FeedbackKey(feedID))
+	profile, err := s.GetProfile(ctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "get profile for feedback lookup")
+	}
+
+	data, err := s.kv.Get(ctx, feedbackKey(profile.NamespaceVersion, feedID))
 	if err != nil {
 		return nil, errors.Wrap(err, "get feedback")
 	}
@@ -141,20 +176,19 @@ func (s *Store) GetFeedback(ctx context.Context, feedID string) (*Feedback, erro
 }
 
 func (s *Store) SaveArchive(ctx context.Context, entry *ArchiveEntry) error {
+	profile, err := s.GetProfile(ctx)
+	if err != nil {
+		return errors.Wrap(err, "get profile for archive")
+	}
+
 	entry.ArchivedAt = time.Now()
 	data, err := json.Marshal(entry)
 	if err != nil {
 		return errors.Wrap(err, "marshal archive entry")
 	}
 
-	if err := s.kv.Set(ctx, ArchiveKey(entry.FeedID), data, 0); err != nil {
+	if err := s.kv.Set(ctx, archiveKey(profile.NamespaceVersion, entry.FeedID), data, 0); err != nil {
 		return errors.Wrap(err, "set archive entry")
-	}
-
-	// Maintain the lightweight archive index inside the global profile.
-	profile, err := s.GetProfile(ctx)
-	if err != nil {
-		return errors.Wrap(err, "get profile for archive index")
 	}
 
 	indexEntry := ArchiveIndexEntry{
@@ -163,7 +197,7 @@ func (s *Store) SaveArchive(ctx context.Context, entry *ArchiveEntry) error {
 		Source:     entry.Labels["source"],
 		ArchivedAt: entry.ArchivedAt,
 	}
-	profile.ArchiveIndex = append(profile.ArchiveIndex, indexEntry)
+	profile.ArchiveIndex = upsertArchiveIndex(profile.ArchiveIndex, indexEntry)
 
 	const maxArchiveIndex = 200
 	if len(profile.ArchiveIndex) > maxArchiveIndex {
@@ -178,7 +212,12 @@ func (s *Store) SaveArchive(ctx context.Context, entry *ArchiveEntry) error {
 }
 
 func (s *Store) GetArchive(ctx context.Context, feedID string) (*ArchiveEntry, error) {
-	data, err := s.kv.Get(ctx, ArchiveKey(feedID))
+	profile, err := s.GetProfile(ctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "get profile for archive lookup")
+	}
+
+	data, err := s.kv.Get(ctx, archiveKey(profile.NamespaceVersion, feedID))
 	if err != nil {
 		return nil, errors.Wrap(err, "get archive entry")
 	}
@@ -192,19 +231,59 @@ func (s *Store) GetArchive(ctx context.Context, feedID string) (*ArchiveEntry, e
 }
 
 func (s *Store) IsArchived(ctx context.Context, feedID string) bool {
-	_, err := s.kv.Get(ctx, ArchiveKey(feedID))
+	profile, err := s.GetProfile(ctx)
+	if err != nil {
+		return false
+	}
+	_, err = s.kv.Get(ctx, archiveKey(profile.NamespaceVersion, feedID))
 
 	return err == nil
 }
 
 func (s *Store) MarkRead(ctx context.Context, feedID string) error {
-	entry := &ReadEntry{FeedID: feedID, ReadAt: time.Now()}
+	return s.MarkReadBatch(ctx, []string{feedID})
+}
+
+func (s *Store) MarkReadBatch(ctx context.Context, feedIDs []string) error {
+	if len(feedIDs) == 0 {
+		return nil
+	}
+
+	profile, err := s.GetProfile(ctx)
+	if err != nil {
+		return errors.Wrap(err, "get profile for read state")
+	}
+
+	for _, feedID := range feedIDs {
+		entry := &ReadEntry{FeedID: feedID, ReadAt: time.Now()}
+		if err := s.saveReadEntryWithNamespace(ctx, profile.NamespaceVersion, entry); err != nil {
+			return err
+		}
+		profile.ReadIndex = upsertReadIndex(profile.ReadIndex, ReadIndexEntry{
+			FeedID: feedID,
+			ReadAt: entry.ReadAt,
+		})
+	}
+
+	const maxReadIndex = 2000
+	if len(profile.ReadIndex) > maxReadIndex {
+		profile.ReadIndex = profile.ReadIndex[len(profile.ReadIndex)-maxReadIndex:]
+	}
+
+	if err := s.SaveProfile(ctx, profile); err != nil {
+		return errors.Wrap(err, "save profile after mark read")
+	}
+
+	return nil
+}
+
+func (s *Store) saveReadEntryWithNamespace(ctx context.Context, namespace int, entry *ReadEntry) error {
 	data, err := json.Marshal(entry)
 	if err != nil {
 		return errors.Wrap(err, "marshal read entry")
 	}
 
-	if err := s.kv.Set(ctx, ReadKey(feedID), data, 0); err != nil {
+	if err := s.kv.Set(ctx, readKey(namespace, entry.FeedID), data, 0); err != nil {
 		return errors.Wrap(err, "set read entry")
 	}
 
@@ -212,7 +291,16 @@ func (s *Store) MarkRead(ctx context.Context, feedID string) error {
 }
 
 func (s *Store) IsRead(ctx context.Context, feedID string) bool {
-	_, err := s.kv.Get(ctx, ReadKey(feedID))
+	profile, err := s.GetProfile(ctx)
+	if err != nil {
+		return false
+	}
+
+	return s.IsReadInNamespace(ctx, profile.NamespaceVersion, feedID)
+}
+
+func (s *Store) IsReadInNamespace(ctx context.Context, namespace int, feedID string) bool {
+	_, err := s.kv.Get(ctx, readKey(namespace, feedID))
 
 	return err == nil
 }
@@ -271,6 +359,9 @@ func applyTagDecay(profile *ProfileGlobal) {
 }
 
 func (s *Store) SaveProfile(ctx context.Context, profile *ProfileGlobal) error {
+	if profile.NamespaceVersion < 0 {
+		profile.NamespaceVersion = 0
+	}
 	profile.LastUpdated = time.Now()
 	data, err := json.Marshal(profile)
 	if err != nil {
@@ -284,10 +375,21 @@ func (s *Store) SaveProfile(ctx context.Context, profile *ProfileGlobal) error {
 	return nil
 }
 
-// UpdateProfileFromFeedback applies a new feedback to the profile using
-// read-modify-write. It upserts tag controls: boost/demote/block from the
-// feedback tags. Weight increases by 0.1 per feedback, capped at 1.0.
-func (s *Store) UpdateProfileFromFeedback(ctx context.Context, fb *Feedback) error {
+func (s *Store) Reset(ctx context.Context) error {
+	profile, err := s.GetProfile(ctx)
+	if err != nil {
+		return errors.Wrap(err, "get profile before reset")
+	}
+
+	return s.SaveProfile(ctx, &ProfileGlobal{
+		NamespaceVersion: profile.NamespaceVersion + 1,
+	})
+}
+
+// ReplaceFeedbackProfile applies a feedback update using read-modify-write.
+// If prev is non-nil, its applied signals are removed before next is added.
+// FeedbackCount tracks unique feedback articles rather than submission times.
+func (s *Store) ReplaceFeedbackProfile(ctx context.Context, prev, next *Feedback) error {
 	profile, err := s.GetProfile(ctx)
 	if err != nil {
 		return errors.Wrap(err, "get profile")
@@ -300,11 +402,19 @@ func (s *Store) UpdateProfileFromFeedback(ctx context.Context, fb *Feedback) err
 		profile.WeeklySnapshotAt = time.Now()
 	}
 
-	for _, ut := range fb.Tags {
-		s.upsertTagControl(profile, ut)
+	if prev == nil && next != nil {
+		profile.FeedbackCount++
+	}
+	if prev != nil && next == nil && profile.FeedbackCount > 0 {
+		profile.FeedbackCount--
 	}
 
-	profile.FeedbackCount++
+	for _, signal := range collectEffectiveSignals(prev) {
+		applySignal(profile, signal, -1)
+	}
+	for _, signal := range collectEffectiveSignals(next) {
+		applySignal(profile, signal, 1)
+	}
 
 	if err := s.SaveProfile(ctx, profile); err != nil {
 		return errors.Wrap(err, "save profile")
@@ -313,31 +423,137 @@ func (s *Store) UpdateProfileFromFeedback(ctx context.Context, fb *Feedback) err
 	return nil
 }
 
-func (s *Store) upsertTagControl(profile *ProfileGlobal, ut UserTag) {
-	const weightDelta = 0.1
+func collectEffectiveSignals(fb *Feedback) []AppliedTagSignal {
+	if fb == nil {
+		return nil
+	}
+	if len(fb.AppliedSignals) > 0 {
+		return fb.AppliedSignals
+	}
 
+	signals := make([]AppliedTagSignal, 0, len(fb.Tags))
+	for _, tag := range fb.Tags {
+		signals = append(signals, AppliedTagSignal{
+			Tag:    tag.Tag,
+			Action: tag.Action,
+			Delta:  0.6,
+		})
+	}
+
+	return signals
+}
+
+func applySignal(profile *ProfileGlobal, signal AppliedTagSignal, direction float64) {
+	if profile == nil || strings.TrimSpace(signal.Tag) == "" || signal.Delta <= 0 {
+		return
+	}
+
+	normalizedDelta := signal.Delta
+	if direction < 0 {
+		normalizedDelta = -normalizedDelta
+	}
+
+	switch signal.Action {
+	case TagActionBoost:
+		mergeSignedTagControl(profile, signal.Tag, normalizedDelta)
+	case TagActionDemote:
+		mergeSignedTagControl(profile, signal.Tag, -normalizedDelta)
+	case TagActionBlock:
+		mergeBlockTagControl(profile, signal.Tag, direction > 0)
+	}
+}
+
+func mergeSignedTagControl(profile *ProfileGlobal, tag string, delta float64) {
 	for i, tc := range profile.TagControls {
-		if tc.Tag != ut.Tag {
+		if tc.Tag != tag {
 			continue
 		}
-
-		profile.TagControls[i].Action = ut.Action
-		newWeight := tc.Weight + weightDelta
-		if newWeight > 1.0 {
-			newWeight = 1.0
+		if tc.Action == TagActionBlock {
+			if delta > 0 {
+				profile.TagControls[i].LastSeen = time.Now()
+			}
+			return
 		}
-		profile.TagControls[i].Weight = newWeight
-		profile.TagControls[i].LastSeen = time.Now()
 
+		next := signedWeight(tc) + delta
+		if math.Abs(next) < 0.05 {
+			profile.TagControls = append(profile.TagControls[:i], profile.TagControls[i+1:]...)
+			return
+		}
+
+		profile.TagControls[i].Action = actionFromSignedWeight(next)
+		profile.TagControls[i].Weight = clampWeight(math.Abs(next))
+		profile.TagControls[i].LastSeen = time.Now()
+		return
+	}
+
+	if math.Abs(delta) < 0.05 {
 		return
 	}
 
 	profile.TagControls = append(profile.TagControls, TagControl{
-		Tag:      ut.Tag,
-		Action:   ut.Action,
-		Weight:   weightDelta,
+		Tag:      tag,
+		Action:   actionFromSignedWeight(delta),
+		Weight:   clampWeight(math.Abs(delta)),
 		LastSeen: time.Now(),
 	})
+}
+
+func mergeBlockTagControl(profile *ProfileGlobal, tag string, enable bool) {
+	for i, tc := range profile.TagControls {
+		if tc.Tag != tag {
+			continue
+		}
+		if !enable {
+			profile.TagControls = append(profile.TagControls[:i], profile.TagControls[i+1:]...)
+			return
+		}
+
+		profile.TagControls[i].Action = TagActionBlock
+		profile.TagControls[i].Weight = 1
+		profile.TagControls[i].LastSeen = time.Now()
+		return
+	}
+
+	if !enable {
+		return
+	}
+
+	profile.TagControls = append(profile.TagControls, TagControl{
+		Tag:      tag,
+		Action:   TagActionBlock,
+		Weight:   1,
+		LastSeen: time.Now(),
+	})
+}
+
+func signedWeight(tc TagControl) float64 {
+	switch tc.Action {
+	case TagActionBoost:
+		return tc.Weight
+	case TagActionDemote:
+		return -tc.Weight
+	default:
+		return 0
+	}
+}
+
+func actionFromSignedWeight(weight float64) TagAction {
+	if weight < 0 {
+		return TagActionDemote
+	}
+	return TagActionBoost
+}
+
+func clampWeight(weight float64) float64 {
+	if weight < 0 {
+		return 0
+	}
+	if weight > 1.5 {
+		return 1.5
+	}
+
+	return weight
 }
 
 // FeedbackToastMessage returns a human-readable toast message explaining
@@ -378,4 +594,62 @@ func joinTags(tags []string) string {
 	}
 
 	return result
+}
+
+func feedbackKey(namespace int, feedID string) []byte {
+	return namespacedKey("feedback", namespace, feedID)
+}
+
+func archiveKey(namespace int, feedID string) []byte {
+	return namespacedKey("archive", namespace, feedID)
+}
+
+func readKey(namespace int, feedID string) []byte {
+	return namespacedKey("read", namespace, feedID)
+}
+
+func namespacedKey(prefix string, namespace int, feedID string) []byte {
+	if namespace <= 0 {
+		return []byte(prefix + ":" + feedID)
+	}
+
+	return []byte(fmt.Sprintf("%s:v%d:%s", prefix, namespace, feedID))
+}
+
+func upsertArchiveIndex(entries []ArchiveIndexEntry, next ArchiveIndexEntry) []ArchiveIndexEntry {
+	deduped := entries[:0]
+	replaced := false
+	for _, current := range entries {
+		if current.FeedID != next.FeedID {
+			deduped = append(deduped, current)
+			continue
+		}
+
+		deduped = append(deduped, next)
+		replaced = true
+	}
+	if !replaced {
+		deduped = append(deduped, next)
+	}
+
+	return deduped
+}
+
+func upsertReadIndex(entries []ReadIndexEntry, next ReadIndexEntry) []ReadIndexEntry {
+	deduped := entries[:0]
+	replaced := false
+	for _, current := range entries {
+		if current.FeedID != next.FeedID {
+			deduped = append(deduped, current)
+			continue
+		}
+
+		deduped = append(deduped, next)
+		replaced = true
+	}
+	if !replaced {
+		deduped = append(deduped, next)
+	}
+
+	return deduped
 }

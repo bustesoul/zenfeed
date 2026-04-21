@@ -18,6 +18,7 @@ package stats
 import (
 	"context"
 	"encoding/json"
+	"sort"
 	"sync"
 	"time"
 
@@ -44,6 +45,7 @@ type SourceStat struct {
 	LastScrapeFetched int       `json:"last_scrape_fetched"`
 	TotalFetched      int64     `json:"total_fetched"`
 	TotalErrors       int64     `json:"total_errors"`
+	PersistSeq        uint64    `json:"-"`
 }
 
 // LLMStat holds LLM token usage since last restart.
@@ -64,10 +66,11 @@ const kvKeyPrefix = "stats:source:"
 // Store is the central stats tracker. It keeps in-memory state and
 // persists per-source stats to KV so history survives restarts.
 type Store struct {
-	mu      sync.Mutex
-	sources map[string]*SourceStat // keyed by source name
-	llm     LLMStat
-	kv      kv.Storage
+	mu        sync.Mutex
+	persistMu sync.Mutex
+	sources   map[string]*SourceStat // keyed by source name
+	llm       LLMStat
+	kv        kv.Storage
 }
 
 // New creates a new Store and loads existing source stats from KV.
@@ -103,6 +106,7 @@ func (s *Store) RecordScrapeEnd(name, url string, fetched int, err error) {
 		src.LastScrapeError = ""
 		src.TotalFetched += int64(fetched)
 	}
+	src.PersistSeq++
 	snapshot := *src // copy before releasing lock
 	s.mu.Unlock()
 
@@ -124,11 +128,6 @@ func (s *Store) RecordTokens(promptTokens, completionTokens int64) {
 func (s *Store) Snapshot(ctx context.Context) (*Snapshot, error) {
 	s.mu.Lock()
 
-	// Merge in-memory sources with any KV-persisted sources not yet in memory.
-	inMemory := make(map[string]struct{}, len(s.sources))
-	for name := range s.sources {
-		inMemory[name] = struct{}{}
-	}
 	llm := s.llm
 	sources := make([]*SourceStat, 0, len(s.sources))
 	for _, src := range s.sources {
@@ -137,8 +136,12 @@ func (s *Store) Snapshot(ctx context.Context) (*Snapshot, error) {
 	}
 	s.mu.Unlock()
 
-	// Load any persisted sources not currently running (e.g. disabled sources).
-	_ = inMemory // currently we only surface active sources; extend if needed.
+	sort.SliceStable(sources, func(i, j int) bool {
+		if sources[i].Name == sources[j].Name {
+			return sources[i].URL < sources[j].URL
+		}
+		return sources[i].Name < sources[j].Name
+	})
 
 	return &Snapshot{Sources: sources, LLM: llm}, nil
 }
@@ -188,6 +191,18 @@ func (s *Store) getOrCreate(name, url string) *SourceStat {
 }
 
 func (s *Store) persist(name string, src *SourceStat) {
+	s.persistMu.Lock()
+	defer s.persistMu.Unlock()
+
+	s.mu.Lock()
+	current, ok := s.sources[name]
+	if !ok || current.PersistSeq != src.PersistSeq {
+		s.mu.Unlock()
+
+		return
+	}
+	s.mu.Unlock()
+
 	data, err := json.Marshal(src)
 	if err != nil {
 		return
