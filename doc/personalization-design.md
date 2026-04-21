@@ -110,6 +110,35 @@ Rust / 工程实践
 { "tag": "某作者",     "action": "block" }
 ```
 
+### 3.6 后端标签编码方案：`article_analysis` JSON label
+
+现有 `Labels` 模型是单值 KV（同 key 覆盖），且 rewrite 每条规则只输出一个 label。  
+为了用**一次 LLM 调用**拿到所有结构化元数据，采用单一 JSON blob label 方案：
+
+**Label 名**：`article_analysis`  
+**生成方式**：独立 rewrite 规则，使用便宜模型（非 gpt-5.4）  
+**内容格式**：
+
+```json
+{
+  "base_quality_score": 8,
+  "primary_topic": "AI/工具",
+  "format": "深度分析",
+  "topics_json": ["AI/工具", "开发效率"]
+}
+```
+
+| 字段 | 用途 |
+|------|------|
+| `base_quality_score` | 重排底盘分，0-10 整数 |
+| `primary_topic` | 主标签，供重排和 UI 展示使用 |
+| `format` | 内容形态，供重排和 UI 展示使用 |
+| `topics_json` | 多主题列表，供反馈面板和重排使用 |
+
+**现有 inverted index 影响**：无。现有 filter/group_by 继续基于原有 labels 工作，不依赖 `article_analysis`。Phase 3+ 若需要 `primary_topic` 进入可检索索引，可额外加一条规则单独输出该 label。
+
+> **不要**将 `topics_json` 直接存为独立 label——现有过滤系统把 label value 当单值精确匹配，存 JSON 数组字符串会导致无法识别其中的独立标签。
+
 ---
 
 ## 四、评分系统
@@ -215,18 +244,50 @@ Rust / 工程实践
 
 ---
 
-## 七、质量分
+## 七、基础质量分（base_quality_score）
 
-### 7.1 质量分与用户无关，独立存在
+### 7.1 base_quality_score 与用户无关，独立存在
 
-构成因素：
+**Phase 1 范围：仅 LLM 内容质量评估**（不依赖任何用户行为数据）
 
-- 全局平均评分
+`base_quality_score` 由独立 rewrite 规则生成，存储在 `article_analysis` JSON label 中，与摘要生成规则分开，使用便宜模型：
+
+```yaml
+llms:
+  - name: cheap          # 新增便宜模型，专用于结构化提取
+    provider: ...
+    model: ...           # 如 gpt-4.1-mini、qwen3 等
+
+rewrites:
+  # 现有：摘要生成（gpt-5.4，质量优先，保持不变）
+  - transform:
+      to_text:
+        prompt: "{{ .summary_html_snippet_for_small_model }} Respond in Chinese"
+    label: summary_html_snippet
+
+  # 新增：结构化分析（便宜模型，一次调用拿全部元数据）
+  - transform:
+      to_text:
+        llm: cheap
+        prompt: |
+          分析这篇文章，仅返回JSON，不要其他内容：
+          {"base_quality_score":7,"primary_topic":"AI/工具","format":"深度分析","topics_json":["AI/工具"]}
+    label: article_analysis
+```
+
+构成因素（Phase 1）：
+
+- LLM 对文章内容扎实度、信息密度的评分
+- 标题与正文一致性（由 LLM rewrite pipeline 判断）
+- 内容重复度（去重时已处理）
+
+> 命名为 `base_quality_score`，不叫"全局质量分"——现阶段只有 LLM 打的分，"全局"语义虚高。
+
+以下因素依赖尚不存在的行为数据（已读状态目前仅在 localStorage），推迟到 Phase 3：
+
 - 全局读完率 / 快速退出率
 - 全局低分率
-- 内容重复度
-- 来源 / 作者历史质量
-- 标题与正文一致性
+- 来源 / 作者历史质量趋势
 
 ### 7.2 质量底线优先
 
@@ -238,7 +299,15 @@ Rust / 工程实践
 
 ### 8.1 三阶段排序
 
-**第一阶段：召回**
+**第一阶段：召回（扩量）**
+
+召回时必须用扩大的 `recall_limit`，而不是直接用展示 `limit`——否则个性化重排只能在已被截断的结果里洗牌，无法把本该进来的文章救回来：
+
+```
+recall_limit = max(limit × 5, 50)
+```
+
+召回维度：
 
 - 主题标签 / 子标签 / 内容形态
 - 相似文章
@@ -251,13 +320,13 @@ Rust / 工程实践
 - 明显低于质量底线的内容
 - 高重复 / 过度相似内容
 
-**第三阶段：重排**
+**第三阶段：重排（API 层）**
 
-综合计算最终得分：
+综合计算最终得分，**个性化重排在 API 层做，不在 rewrite pipeline**（rewrite 只在写入时跑一次，分数写入后冻结，跟不上用户后续反馈）：
 
 ```
 final_score =
-  quality_score          // 内容质量分（底盘）
+  base_quality_score     // 内容基础质量分（底盘，LLM 评估）
   × tag_control_weight   // 用户标签控制（强乘子）
   + rating_history       // 用户直接打分历史
   + format_preference    // 内容形态偏好
@@ -265,6 +334,8 @@ final_score =
   - diversity_penalty    // 去重与多样性修正
   + behavior_signal      // 行为反馈修正（辅助，衰减）
 ```
+
+重排完成后，截取最终 `limit` 条返回。
 
 ### 8.2 显式标签权重是强乘子，但建立在质量底线上
 
@@ -336,32 +407,58 @@ final_score =
 
 ## 十一、架构设计
 
+> **单用户范围约定**：本系统面向单用户自托管场景。现有认证是单组环境变量凭证，不存在多用户实体。所有 KV key 均不使用 `user:*` 前缀，避免误导。
+
+### stable feed_id 暴露
+
+后端已有稳定 uint64 ID（来自抓取链路），但当前 `model.Feed.ID` 无 json tag，前端拿不到，只能用 label 哈希作为临时 ID（换 label 就变了，不稳定）。
+
+**必须修改**：将 `Feed.ID` 以**字符串形式**暴露给前端（不能裸出 uint64 数值，JS 对 > 2⁵³ 的整数有精度丢失问题）。
+
+前端改成统一用字符串 id，`getFeedItemId()` 替换为后端返回的稳定 id。
+
+### KV 存储设计（NutsDB）
+
+当前 KV 是 NutsDB（非 bbolt），只有 Get/Set，无 Delete/List/Scan。采用两类 key，Profile 用 read-modify-write 整 blob 模式，无需 KV 扩展：
+
+| Key | 内容 | 说明 |
+|-----|------|------|
+| `profile:global` | 聚合偏好 blob（标签权重 + 控制规则）| 小，频繁读写 |
+| `feedback:{feed_id}` | 单篇原始反馈 JSON | 每篇一条，不随 feed 清理 |
+| `read:{feed_id}` | 已读标记（时间戳）| 替代 localStorage |
+| `archive:{feed_id}` | 归档内容 + feedback 快照 | 永久保留 |
+
+`profile:global` 只存聚合结果（当前偏好权重），不存全部反馈历史——避免越存越大。反馈历史由 `feedback:{feed_id}` 分散存储。
+
 ### 新增组件
 
 | 组件 | 路径 | 说明 |
 |------|------|------|
-| Feedback API | `PATCH /api/feeds/{id}/feedback` | 接收用户评分、标签（含动作语义）|
-| Feedback 存储 | KV namespace `user:feedback` | per-feed 持久化，不依赖 feed 生命周期 |
-| Preference 计算器 | `pkg/preference/` | 计算偏好 profile（标签权重 + embedding 中心点）|
-| 偏好注入 rewrite | rewrite pipeline | 新文章写入时计算 `personal_score` label |
-| 前端评分 UI | zenfeed-web，feed 卡片 | 10分 + 标签（含动作）+ 理由 |
+| `article_analysis` rewrite 规则 | `config.yaml` | 便宜模型生成结构化元数据 JSON label |
+| Feedback API | `pkg/api/http/` JSON-RPC 风格 | 接收用户评分、标签（含动作语义）|
+| Archive API | `pkg/api/http/` JSON-RPC 风格 | 归档文章，豁免 retention |
+| Preference 读取 API | `pkg/api/http/` JSON-RPC 风格 | 返回当前 profile:global |
+| 个性化重排 | `pkg/api/http/` 查询层 | 召回扩量 → 重排 → 截取 |
+| 前端反馈 UI | zenfeed-web，feed 卡片 | 10分 + 标签（含动作）+ 理由 |
 | 用户控制面板 | zenfeed-web | 查看/编辑/重置标签控制规则 |
 
-### API 设计（草稿）
+### API 设计（JSON-RPC 风格，与现有 /query /write 保持一致）
 
 ```
-PATCH /api/feeds/{id}/feedback
+POST /api/feedback
 Body:
 {
+  "feed_id": "1234567890",      // 字符串形式的 stable id
   "score": 8,
   "score_reason": "深度好",
   "tags": [
     { "tag": "AI / 工具", "action": "boost" },
     { "tag": "快讯",      "action": "demote" }
-  ]
+  ],
+  "archive": true
 }
 
-GET /api/preference/profile
+GET /api/preference
 Response:
 {
   "tag_controls": [
@@ -374,17 +471,26 @@ Response:
 }
 ```
 
-### personal_score 计算方式（草稿）
+### personal_score 计算位置
+
+**不在 rewrite pipeline**（rewrite 在写入时跑一次，分数冻结，无法响应后续反馈）。
+
+个性化重排在 **API 查询层**完成：
 
 ```
+recall_limit = max(limit × 5, 50)
+// 1. 用 recall_limit 召回候选集
+// 2. 对每篇计算 personal_score，并记录匹配的偏好规则：
 personal_score =
-  quality_score                                           // 质量底盘
-  × tag_control_multiplier                               // 标签控制强乘子
+  base_quality_score                                          // 质量底盘（LLM 分）
+  × tag_control_multiplier                                   // 标签控制强乘子
   + α * cosine_similarity(article_embedding, interest_vector)
   + β * rating_history_signal
   + (1 - α - β) * format_preference_signal
+// 3. 按 personal_score 降序排列，截取 limit 条返回
 
-// 冷启动（无反馈）时 α=β=0，只用 quality_score
+// 冷启动（无反馈）时 α=β=0，只用 base_quality_score
+// 每条结果附带 matched_preferences []string，供前端渲染推荐原因标签
 ```
 
 ---
@@ -445,12 +551,101 @@ personal_score =
 提交后：
 1. 若勾选归档 → POST `/api/archive`（含完整 feed 内容 + feedback）
 2. 自动标记已读（从 feed 流消失）
-3. Toast 提示"已提交"或"已归档"
+3. **即时解释 Toast**（不是简单的"已提交"）：
+
+```
+✓ 已记录  将为你多推「AI/工具 · 深度分析」类内容
+```
+
+反馈理由选了负面词时（太浅/重复/标题党）：
+
+```
+✓ 已记录  将减少「快讯」类内容曝光
+```
 
 ### 改动三：主页新增 Tab（已确认）
 
 ```
 [ 今日 ]  [ 通知 ]  [ 高级 ]  [ 📚 知识库 ]  [ 🎛 偏好 ]
+```
+
+### 改动四：推荐系统可见性设计
+
+#### 4.1 学习进度指示（主页顶部，仅冷启动阶段显示）
+
+反馈数 < 5 条时，主页 feed 列表顶部显示引导条：
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  🧠 个性化学习中  ██░░░░░░░░  2/5 篇  给更多文章反馈以激活排序  │
+└─────────────────────────────────────────────────────────┘
+```
+
+反馈数 ≥ 5 后该条消失，不再打扰。
+
+#### 4.2 里程碑 Toast（一次性触发）
+
+| 触发条件 | Toast 内容 |
+|----------|-----------|
+| 第 1 条反馈提交 | `🎉 偏好学习已启动，再给 4 篇反馈可激活个性化排序` |
+| 第 5 条反馈提交 | `✨ 个性化排序已激活！已发现你偏好「AI/工具 · 深度分析」` |
+| 第 20 条反馈提交 | `📈 偏好画像已成熟，推荐准确度持续提升中` |
+
+每个里程碑只触发一次，记录在 localStorage，不重复弹出。
+
+#### 4.3 feed 卡片推荐原因标签
+
+个性化排序激活后（反馈 ≥ 5），每张 feed 卡片左下角显示小标签，说明为什么被提升：
+
+```
+┌──────────────────────────────────────┐
+│  GPT-5 工具链实战                     │
+│  Github 热榜 · 2026-04-20             │
+│  ↑ AI/工具  ↑ 深度分析                │  ← 匹配了哪个偏好
+└──────────────────────────────────────┘
+```
+
+被压低的文章（匹配了少推规则）不显示标签，只是排序靠后，不做视觉强调（避免负面感）。
+
+后端重排时在每条结果附上 `matched_preferences: ["AI/工具", "深度分析"]`，前端直接渲染。
+
+#### 4.4 偏好面板加"本周变化"diff
+
+在偏好画像右侧加本周增量，让用户看到系统在持续学习：
+
+```
+┌──────────────────────────────────────────────────────┐
+│  偏好画像                    基于 42 篇反馈学习        │
+│                                                      │
+│  正向：                                              │
+│  AI/工具  ████████ 0.9  (+0.2 本周)                  │
+│  Rust     ██████   0.6  (+0.1 本周)                  │
+│                                                      │
+│  负向：                                              │
+│  快讯     ████████-0.8  (-0.3 本周)                  │
+└──────────────────────────────────────────────────────┘
+```
+
+diff 数据存在 `profile:global` blob 里（每次更新时保存上次快照）。
+
+#### 4.5 完整的用户感知弧线
+
+```
+Day 1，第 1 篇反馈
+  → Toast：偏好学习启动，进度条出现
+
+Day 1，第 5 篇反馈
+  → Toast：个性化排序激活
+  → feed 卡片开始出现「↑ AI/工具」推荐原因标签
+  → 进度条消失
+
+Week 1，累计 ~20 篇
+  → Toast：偏好画像已成熟
+  → 偏好面板出现明显权重分布 + 本周 diff
+
+持续使用
+  → 知识库积累文章，可回看兴趣演变
+  → 偏好面板 diff 持续更新，系统"活着"的感觉清晰
 ```
 
 ### 知识库页面（已确认）
@@ -507,7 +702,7 @@ personal_score =
 
 | 当前 | 目标 |
 |------|------|
-| localStorage `zenfeed_read_feeds` | 后端 KV `user:read:{feed_id}` |
+| localStorage `zenfeed_read_feeds` | 后端 KV `read:{feed_id}` |
 | 仅当前浏览器有效 | 跨设备同步 |
 | 清缓存丢失 | 永久保留 |
 
@@ -542,8 +737,8 @@ personal_score =
 |------|------|------|
 | Phase 1 | Feedback API + Archive 存储（豁免 retention）| ~300 行 Go |
 | Phase 2 | 前端"知识库"页面 + 控制面板 | ~500 行 Svelte |
-| Phase 3 | Preference 计算器（标签权重 + embedding 中心点）| ~200 行 Go |
-| Phase 4 | personal_score 注入 rewrite pipeline | ~100 行 Go |
+| Phase 3 | Preference 计算器（标签权重 + embedding 中心点）+ API 层重排（recall_limit + personal_score）| ~200 行 Go |
+| Phase 4 | 推荐原因标签（matched_preferences）+ 里程碑 Toast + 进度条 + 偏好 diff | ~150 行 Svelte |
 | Phase 5 | 行为信号衰减 + 探索策略 | ~150 行 Go |
 
 ---
@@ -553,8 +748,8 @@ personal_score =
 - [ ] 负向反馈（不感兴趣）是否归档？建议：不归档，只记录偏好信号
 - [ ] 知识库是否支持导出（Markdown / JSON）？
 - [ ] 偏好 profile 多久更新一次？（每次有新反馈 / 每小时 / 每天）
-- [ ] 冷启动阶段（反馈 < N 条）的偏好排序策略？
-- [ ] 是否需要"为什么推这篇"的可解释性展示？
+- [x] 冷启动阶段（反馈 < 5 条）的偏好排序策略？→ 进度条引导 + bypass 重排，纯 base_quality_score
+- [x] 是否需要"为什么推这篇"的可解释性展示？→ 已设计 matched_preferences 标签
 - [ ] 标签动作字典完整枚举（boost / demote / block / flag / …）
 - [ ] 十分制到排序权重的具体映射表
 
@@ -566,3 +761,5 @@ personal_score =
 |------|------|
 | 2026-04-20 | 初稿，基于与用户的讨论 |
 | 2026-04-21 | 大幅重写：纳入双主轴标签结构、标签动作语义、十分制分段规则、三阶段排序、行为反馈辅助层等完整规则体系 |
+| 2026-04-21 | 纳入第二轮 peer review 修正：召回扩量（recall_limit = max(limit×5, 50)）、feed_id 以字符串暴露、三字段标签编码方案（topics_json + primary_topic + format）、单用户 KV key 命名（profile:global / feedback:{feed_id} 等）、profile blob 拆分、质量分重命名为 base_quality_score、personal_score 移至 API 重排层、API 风格统一为 JSON-RPC |
+| 2026-04-21 | 补充推荐系统可见性设计：学习进度条、里程碑 Toast（第1/5/20条）、feed 卡片推荐原因标签（matched_preferences）、偏好面板本周 diff；后端重排结果附带 matched_preferences 字段 |
