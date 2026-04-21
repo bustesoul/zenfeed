@@ -21,6 +21,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/pkg/errors"
@@ -63,9 +64,10 @@ type Feedback struct {
 
 // TagControl is an aggregated tag preference in the profile.
 type TagControl struct {
-	Tag    string    `json:"tag"`
-	Action TagAction `json:"action"`
-	Weight float64   `json:"weight"`
+	Tag      string    `json:"tag"`
+	Action   TagAction `json:"action"`
+	Weight   float64   `json:"weight"`
+	LastSeen time.Time `json:"last_seen,omitempty"` // updated on each feedback interaction
 }
 
 // ArchiveIndexEntry is a lightweight record of a saved article stored inside profile:global.
@@ -227,7 +229,45 @@ func (s *Store) GetProfile(ctx context.Context) (*ProfileGlobal, error) {
 		return nil, errors.Wrap(err, "unmarshal profile")
 	}
 
+	applyTagDecay(&profile)
+
 	return &profile, nil
+}
+
+// applyTagDecay applies time-based exponential decay to tag weights.
+// Half-life is 30 days; tags below 0.05 are pruned.
+// Only affects tags that have been seen (LastSeen non-zero) and are older than 30 days.
+func applyTagDecay(profile *ProfileGlobal) {
+	const (
+		halfLifeDays    = 30.0
+		decayStartDays  = 30.0
+		removeThreshold = 0.05
+	)
+
+	now := time.Now()
+	kept := profile.TagControls[:0]
+
+	for _, tc := range profile.TagControls {
+		if tc.LastSeen.IsZero() {
+			kept = append(kept, tc)
+			continue
+		}
+
+		days := now.Sub(tc.LastSeen).Hours() / 24
+		if days < decayStartDays {
+			kept = append(kept, tc)
+			continue
+		}
+
+		tc.Weight *= math.Pow(0.5, days/halfLifeDays)
+		if tc.Weight < removeThreshold {
+			continue // prune
+		}
+
+		kept = append(kept, tc)
+	}
+
+	profile.TagControls = kept
 }
 
 func (s *Store) SaveProfile(ctx context.Context, profile *ProfileGlobal) error {
@@ -287,14 +327,16 @@ func (s *Store) upsertTagControl(profile *ProfileGlobal, ut UserTag) {
 			newWeight = 1.0
 		}
 		profile.TagControls[i].Weight = newWeight
+		profile.TagControls[i].LastSeen = time.Now()
 
 		return
 	}
 
 	profile.TagControls = append(profile.TagControls, TagControl{
-		Tag:    ut.Tag,
-		Action: ut.Action,
-		Weight: weightDelta,
+		Tag:      ut.Tag,
+		Action:   ut.Action,
+		Weight:   weightDelta,
+		LastSeen: time.Now(),
 	})
 }
 

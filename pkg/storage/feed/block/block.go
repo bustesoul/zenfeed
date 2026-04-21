@@ -255,9 +255,10 @@ const (
 
 // FeedVO is the feed view for query result.
 type FeedVO struct {
-	*model.Feed `json:",inline"`
-	Vectors     [][]float32 `json:"-"`
-	Score       float32     `json:"score,omitempty"` // Only exists when SemanticFilter is set.
+	*model.Feed        `json:",inline"`
+	Vectors            [][]float32 `json:"-"`
+	Score              float32     `json:"score,omitempty"`              // Only exists when SemanticFilter is set.
+	MatchedPreferences []string    `json:"matched_preferences,omitempty"` // Tags that matched user preferences.
 }
 
 type FeedVOs []*FeedVO

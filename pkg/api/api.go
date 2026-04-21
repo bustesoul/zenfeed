@@ -594,15 +594,39 @@ func (a *api) Query(ctx context.Context, req *QueryRequest) (resp *QueryResponse
 			return personalScore(feeds[i], profile) > personalScore(feeds[j], profile)
 		})
 
-		// Collect boost tags matched across returned feeds (after truncation).
 		limit := req.Limit
 		if limit > len(feeds) {
 			limit = len(feeds)
 		}
-		feeds = feeds[:limit]
 
+		// Exploration strategy (Phase 5): when we have enough feedback and enough
+		// candidates, replace ~15% of the top results with diverse tail items so
+		// the user is not stuck in a filter bubble.
+		if profile.FeedbackCount >= 5 && len(feeds) > limit {
+			topN := limit * 85 / 100 // 85 % by personal score
+			if topN < 1 {
+				topN = 1
+			}
+			exploreN := limit - topN
+			tail := feeds[topN:] // diverse candidates (lower personal score)
+			// Shuffle tail deterministically-enough using feed IDs.
+			for i := len(tail) - 1; i > 0; i-- {
+				j := int(tail[i].Feed.ID) % (i + 1)
+				tail[i], tail[j] = tail[j], tail[i]
+			}
+			if exploreN > len(tail) {
+				exploreN = len(tail)
+			}
+			feeds = append(feeds[:topN], tail[:exploreN]...)
+		} else {
+			feeds = feeds[:limit]
+		}
+
+		// Annotate each feed with the boost tags it matched, and collect
+		// the aggregate set for the QueryResponse header.
 		boostedSet := make(map[string]struct{})
 		for _, f := range feeds {
+			var perFeed []string
 			for _, tc := range profile.TagControls {
 				if tc.Action != personalization.TagActionBoost {
 					continue
@@ -611,10 +635,12 @@ func (a *api) Query(ctx context.Context, req *QueryRequest) (resp *QueryResponse
 				for _, lbl := range f.Labels {
 					if strings.Contains(strings.ToLower(lbl.Value), tagLower) {
 						boostedSet[tc.Tag] = struct{}{}
+						perFeed = append(perFeed, tc.Tag)
 						break
 					}
 				}
 			}
+			f.MatchedPreferences = perFeed
 		}
 		for tag := range boostedSet {
 			matchedPreferences = append(matchedPreferences, tag)
