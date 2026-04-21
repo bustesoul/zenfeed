@@ -333,7 +333,7 @@ func applyTagDecay(profile *ProfileGlobal) {
 	)
 
 	now := time.Now()
-	kept := profile.TagControls[:0]
+	kept := make([]TagControl, 0, len(profile.TagControls))
 
 	for _, tc := range profile.TagControls {
 		if tc.LastSeen.IsZero() {
@@ -617,7 +617,7 @@ func namespacedKey(prefix string, namespace int, feedID string) []byte {
 }
 
 func upsertArchiveIndex(entries []ArchiveIndexEntry, next ArchiveIndexEntry) []ArchiveIndexEntry {
-	deduped := entries[:0]
+	deduped := make([]ArchiveIndexEntry, 0, len(entries)+1)
 	replaced := false
 	for _, current := range entries {
 		if current.FeedID != next.FeedID {
@@ -636,7 +636,7 @@ func upsertArchiveIndex(entries []ArchiveIndexEntry, next ArchiveIndexEntry) []A
 }
 
 func upsertReadIndex(entries []ReadIndexEntry, next ReadIndexEntry) []ReadIndexEntry {
-	deduped := entries[:0]
+	deduped := make([]ReadIndexEntry, 0, len(entries)+1)
 	replaced := false
 	for _, current := range entries {
 		if current.FeedID != next.FeedID {

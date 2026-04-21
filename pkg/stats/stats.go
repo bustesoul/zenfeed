@@ -45,7 +45,9 @@ type SourceStat struct {
 	LastScrapeFetched int       `json:"last_scrape_fetched"`
 	TotalFetched      int64     `json:"total_fetched"`
 	TotalErrors       int64     `json:"total_errors"`
-	PersistSeq        uint64    `json:"-"`
+	// PersistSeq increments on each RecordScrapeEnd call. The async persist
+	// goroutine checks this before writing to KV to discard stale snapshots.
+	PersistSeq uint64 `json:"-"`
 }
 
 // LLMStat holds LLM token usage since last restart.

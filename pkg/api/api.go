@@ -656,7 +656,7 @@ func (a *api) Query(ctx context.Context, req *QueryRequest) (resp *QueryResponse
 			exploreN := limit - topN
 			tail := feeds[topN:] // diverse candidates (lower personal score)
 			for i := len(tail) - 1; i > 0; i-- {
-				j := int(tail[i].Feed.ID) % (i + 1)
+				j := rand.Intn(i + 1)
 				tail[i], tail[j] = tail[j], tail[i]
 			}
 			if exploreN > len(tail) {
