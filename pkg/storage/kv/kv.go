@@ -105,7 +105,7 @@ func (k *kv) Run() error {
 	db, err := nutsdb.Open(
 		nutsdb.DefaultOptions,
 		nutsdb.WithDir(k.Config().Dir),
-		nutsdb.WithSyncEnable(false),
+		nutsdb.WithSyncEnable(true),
 	)
 	if err != nil {
 		return errors.Wrap(err, "open db")
