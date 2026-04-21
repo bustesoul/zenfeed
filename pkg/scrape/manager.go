@@ -25,6 +25,7 @@ import (
 	"github.com/glidea/zenfeed/pkg/config"
 	"github.com/glidea/zenfeed/pkg/model"
 	"github.com/glidea/zenfeed/pkg/scrape/scraper"
+	"github.com/glidea/zenfeed/pkg/stats"
 	"github.com/glidea/zenfeed/pkg/storage/feed"
 	"github.com/glidea/zenfeed/pkg/storage/kv"
 	"github.com/glidea/zenfeed/pkg/telemetry"
@@ -94,6 +95,7 @@ type Dependencies struct {
 	ScraperFactory scraper.Factory
 	FeedStorage    feed.Storage
 	KVStorage      kv.Storage
+	Stats          *stats.Store // optional; may be nil
 }
 
 // --- Factory code block ---
@@ -190,12 +192,21 @@ func (m *manager) Close() error {
 }
 
 func (m *manager) newScraper(c *scraper.Config) (scraper.Scraper, error) {
+	if st := m.Dependencies().Stats; st != nil {
+		url := ""
+		if c.RSS != nil {
+			url = c.RSS.URL
+		}
+		st.LoadSource(m.Context(), c.Name, url)
+	}
+
 	return m.Dependencies().ScraperFactory.New(
 		c.Name,
 		c,
 		scraper.Dependencies{
 			FeedStorage: m.Dependencies().FeedStorage,
 			KVStorage:   m.Dependencies().KVStorage,
+			Stats:       m.Dependencies().Stats,
 		},
 	)
 }

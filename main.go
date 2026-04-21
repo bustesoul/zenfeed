@@ -40,6 +40,7 @@ import (
 	"github.com/glidea/zenfeed/pkg/schedule/rule"
 	"github.com/glidea/zenfeed/pkg/scrape"
 	"github.com/glidea/zenfeed/pkg/scrape/scraper"
+	"github.com/glidea/zenfeed/pkg/stats"
 	"github.com/glidea/zenfeed/pkg/storage/feed"
 	"github.com/glidea/zenfeed/pkg/storage/feed/block"
 	"github.com/glidea/zenfeed/pkg/storage/feed/block/chunk"
@@ -124,6 +125,7 @@ type App struct {
 	telemetry  telemetryserver.Server
 
 	kvStorage     kv.Storage
+	statsStore    *stats.Store
 	llmFactory    llm.Factory
 	rewriter      rewrite.Rewriter
 	feedStorage   feed.Storage
@@ -166,6 +168,8 @@ func (a *App) setup() error {
 	if err := a.setupKVStorage(); err != nil {
 		return errors.Wrap(err, "setup kv storage")
 	}
+	a.statsStore = stats.New(a.kvStorage)
+	llm.SetStatsTracker(a.statsStore)
 	if err := a.setupObjectStorage(); err != nil {
 		return errors.Wrap(err, "setup object storage")
 	}
@@ -317,6 +321,7 @@ func (a *App) setupAPI() (err error) {
 		FeedStorage:   a.feedStorage,
 		LLMFactory:    a.llmFactory,
 		KVStorage:     a.kvStorage,
+		StatsStore:    a.statsStore,
 	})
 	if err != nil {
 		return err
@@ -375,6 +380,7 @@ func (a *App) setupScraper() (err error) {
 		ScraperFactory: scraper.NewFactory(),
 		FeedStorage:    a.feedStorage,
 		KVStorage:      a.kvStorage,
+		Stats:          a.statsStore,
 	})
 	if err != nil {
 		return err

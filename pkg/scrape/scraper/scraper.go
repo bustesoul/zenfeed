@@ -25,6 +25,7 @@ import (
 
 	"github.com/glidea/zenfeed/pkg/component"
 	"github.com/glidea/zenfeed/pkg/model"
+	"github.com/glidea/zenfeed/pkg/stats"
 	"github.com/glidea/zenfeed/pkg/storage/feed"
 	"github.com/glidea/zenfeed/pkg/storage/kv"
 	"github.com/glidea/zenfeed/pkg/telemetry"
@@ -81,6 +82,7 @@ func (c *Config) Validate() error {
 type Dependencies struct {
 	FeedStorage feed.Storage
 	KVStorage   kv.Storage
+	Stats       stats.Tracker // optional; may be nil
 }
 
 // --- Factory code block ---
@@ -153,6 +155,13 @@ func (s *scraper) Run() (err error) {
 }
 
 func (s *scraper) scrapeUntilSuccess(ctx context.Context) {
+	url := s.sourceURL()
+	if st := s.Dependencies().Stats; st != nil {
+		st.RecordScrapeStart(s.Config().Name, url)
+	}
+
+	var lastFetched int
+	var lastErr error
 	_ = retry.Backoff(ctx, func() (err error) {
 		opCtx := telemetry.StartWith(ctx, append(s.TelemetryLabels(), telemetrymodel.KeyOperation, "scrape")...)
 		defer func() { telemetry.End(opCtx, err) }()
@@ -163,6 +172,8 @@ func (s *scraper) scrapeUntilSuccess(ctx context.Context) {
 		// Read feeds from source.
 		feeds, err := s.source.Read(opCtx)
 		if err != nil {
+			lastErr = err
+
 			return errors.Wrap(err, "reading source feeds")
 		}
 		log.Debug(opCtx, "reading source feeds success", "count", len(feeds))
@@ -171,14 +182,21 @@ func (s *scraper) scrapeUntilSuccess(ctx context.Context) {
 		processed := s.processFeeds(ctx, feeds)
 		log.Debug(opCtx, "processed feeds", "count", len(processed))
 		if len(processed) == 0 {
+			lastFetched = 0
+			lastErr = nil
+
 			return nil
 		}
 
 		// Save processed feeds.
 		if err := s.Dependencies().FeedStorage.Append(opCtx, processed...); err != nil {
+			lastErr = err
+
 			return errors.Wrap(err, "saving feeds")
 		}
 		log.Debug(opCtx, "appending feeds success")
+		lastFetched = len(processed)
+		lastErr = nil
 
 		return nil
 	}, &retry.Options{
@@ -186,6 +204,19 @@ func (s *scraper) scrapeUntilSuccess(ctx context.Context) {
 		MaxInterval: 16 * time.Minute,
 		MaxAttempts: retry.InfAttempts,
 	})
+
+	if st := s.Dependencies().Stats; st != nil {
+		st.RecordScrapeEnd(s.Config().Name, url, lastFetched, lastErr)
+	}
+}
+
+// sourceURL returns the effective URL of this scraper's RSS source.
+func (s *scraper) sourceURL() string {
+	if s.Config().RSS != nil {
+		return s.Config().RSS.URL
+	}
+
+	return ""
 }
 
 func (s *scraper) processFeeds(ctx context.Context, feeds []*model.Feed) []*model.Feed {

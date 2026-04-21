@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -34,6 +35,7 @@ import (
 	"github.com/glidea/zenfeed/pkg/llm"
 	"github.com/glidea/zenfeed/pkg/model"
 	"github.com/glidea/zenfeed/pkg/personalization"
+	"github.com/glidea/zenfeed/pkg/stats"
 	"github.com/glidea/zenfeed/pkg/storage/feed"
 	"github.com/glidea/zenfeed/pkg/storage/feed/block"
 	"github.com/glidea/zenfeed/pkg/storage/kv"
@@ -71,8 +73,10 @@ type API interface {
 	Archive(ctx context.Context, req *ArchiveRequest) (resp *ArchiveResponse, err error)
 	MarkRead(ctx context.Context, req *MarkReadRequest) (resp *MarkReadResponse, err error)
 	GetProfile(ctx context.Context, req *GetProfileRequest) (resp *GetProfileResponse, err error)
+	ListReads(ctx context.Context, req *ListReadsRequest) (resp *ListReadsResponse, err error)
 	ListArchives(ctx context.Context, req *ListArchivesRequest) (resp *ListArchivesResponse, err error)
 	ResetProfile(ctx context.Context, req *ResetProfileRequest) (resp *ResetProfileResponse, err error)
+	GetStats(ctx context.Context, req *GetStatsRequest) (resp *GetStatsResponse, err error)
 }
 
 type Config struct {
@@ -98,6 +102,7 @@ type Dependencies struct {
 	FeedStorage   feed.Storage
 	LLMFactory    llm.Factory
 	KVStorage     kv.Storage
+	StatsStore    *stats.Store
 }
 
 type QueryAppConfigSchemaRequest struct{}
@@ -271,6 +276,13 @@ type GetProfileResponse struct {
 	*personalization.ProfileGlobal
 }
 
+type ListReadsRequest struct{}
+
+type ListReadsResponse struct {
+	Reads []personalization.ReadIndexEntry `json:"reads"`
+	Total int                              `json:"total"`
+}
+
 type ListArchivesRequest struct{}
 
 type ListArchivesResponse struct {
@@ -282,6 +294,12 @@ type ResetProfileRequest struct{}
 
 type ResetProfileResponse struct {
 	Message string `json:"message"`
+}
+
+type GetStatsRequest struct{}
+
+type GetStatsResponse struct {
+	*stats.Snapshot
 }
 
 type Error struct {
@@ -585,31 +603,58 @@ func (a *api) Query(ctx context.Context, req *QueryRequest) (resp *QueryResponse
 		return &QueryResponse{Feeds: []*block.FeedVO{}}, nil
 	}
 
-	// Personal re-ranking.
+	// Personal filtering and re-ranking.
 	var matchedPreferences []string
 	store := personalization.NewStore(a.Dependencies().KVStorage)
 	profile, profileErr := store.GetProfile(ctx)
-	if profileErr == nil && len(profile.TagControls) > 0 {
-		sort.Slice(feeds, func(i, j int) bool {
-			return personalScore(feeds[i], profile) > personalScore(feeds[j], profile)
-		})
-
-		limit := req.Limit
-		if limit > len(feeds) {
-			limit = len(feeds)
+	namespaceVersion := 0
+	if profileErr == nil {
+		namespaceVersion = profile.NamespaceVersion
+	}
+	unreadFeeds := feeds[:0]
+	for _, current := range feeds {
+		if store.IsReadInNamespace(ctx, namespaceVersion, strconv.FormatUint(current.ID, 10)) {
+			continue
 		}
+		unreadFeeds = append(unreadFeeds, current)
+	}
+	feeds = unreadFeeds
+	if len(feeds) == 0 {
+		return &QueryResponse{Feeds: []*block.FeedVO{}}, nil
+	}
+
+	if profileErr == nil && len(profile.TagControls) > 0 {
+		feeds = filterBlockedFeeds(feeds, profile)
+		if len(feeds) == 0 {
+			return &QueryResponse{Feeds: []*block.FeedVO{}}, nil
+		}
+	}
+
+	limit := req.Limit
+	if limit > len(feeds) {
+		limit = len(feeds)
+	}
+
+	if profileErr == nil && profile.FeedbackCount >= minFeedbackForPersonalization && len(profile.TagControls) > 0 {
+		sort.SliceStable(feeds, func(i, j int) bool {
+			left := personalScore(feeds[i], profile)
+			right := personalScore(feeds[j], profile)
+			if left == right {
+				return feeds[i].Time.After(feeds[j].Time)
+			}
+			return left > right
+		})
 
 		// Exploration strategy (Phase 5): when we have enough feedback and enough
 		// candidates, replace ~15% of the top results with diverse tail items so
 		// the user is not stuck in a filter bubble.
-		if profile.FeedbackCount >= 5 && len(feeds) > limit {
+		if len(feeds) > limit {
 			topN := limit * 85 / 100 // 85 % by personal score
 			if topN < 1 {
 				topN = 1
 			}
 			exploreN := limit - topN
 			tail := feeds[topN:] // diverse candidates (lower personal score)
-			// Shuffle tail deterministically-enough using feed IDs.
 			for i := len(tail) - 1; i > 0; i-- {
 				j := int(tail[i].Feed.ID) % (i + 1)
 				tail[i], tail[j] = tail[j], tail[i]
@@ -622,31 +667,29 @@ func (a *api) Query(ctx context.Context, req *QueryRequest) (resp *QueryResponse
 			feeds = feeds[:limit]
 		}
 
-		// Annotate each feed with the boost tags it matched, and collect
-		// the aggregate set for the QueryResponse header.
 		boostedSet := make(map[string]struct{})
-		for _, f := range feeds {
-			var perFeed []string
-			for _, tc := range profile.TagControls {
-				if tc.Action != personalization.TagActionBoost {
-					continue
-				}
-				tagLower := strings.ToLower(tc.Tag)
-				for _, lbl := range f.Labels {
-					if strings.Contains(strings.ToLower(lbl.Value), tagLower) {
-						boostedSet[tc.Tag] = struct{}{}
-						perFeed = append(perFeed, tc.Tag)
-						break
-					}
-				}
+		for _, current := range feeds {
+			current.MatchedPreferences = matchedBoostTags(current.Feed, profile)
+			for _, tag := range current.MatchedPreferences {
+				boostedSet[tag] = struct{}{}
 			}
-			f.MatchedPreferences = perFeed
 		}
 		for tag := range boostedSet {
 			matchedPreferences = append(matchedPreferences, tag)
 		}
-	} else if len(feeds) > req.Limit {
-		feeds = feeds[:req.Limit]
+		sort.Strings(matchedPreferences)
+	} else {
+		sort.SliceStable(feeds, func(i, j int) bool {
+			left := baseRankingScore(feeds[i])
+			right := baseRankingScore(feeds[j])
+			if left == right {
+				return feeds[i].Time.After(feeds[j].Time)
+			}
+			return left > right
+		})
+		if len(feeds) > req.Limit {
+			feeds = feeds[:req.Limit]
+		}
 	}
 
 	// Summarize feeds.
@@ -691,6 +734,19 @@ func (a *api) Feedback(ctx context.Context, req *FeedbackRequest) (*FeedbackResp
 	}
 
 	store := personalization.NewStore(a.Dependencies().KVStorage)
+	sourceFeed, sourceErr := a.lookupFeedByID(ctx, req.FeedID)
+	if req.Archive && sourceErr != nil {
+		return nil, sourceErr
+	}
+
+	prev, err := store.GetFeedback(ctx, req.FeedID)
+	switch {
+	case err == nil:
+	case errors.Is(err, kv.ErrNotFound):
+		prev = nil
+	default:
+		return nil, ErrInternal(errors.Wrap(err, "get previous feedback"))
+	}
 
 	fb := &personalization.Feedback{
 		FeedID:      req.FeedID,
@@ -699,13 +755,27 @@ func (a *api) Feedback(ctx context.Context, req *FeedbackRequest) (*FeedbackResp
 		Tags:        req.Tags,
 		Archive:     req.Archive,
 	}
+	if prev != nil {
+		fb.CreatedAt = prev.CreatedAt
+	}
+	if sourceFeed != nil {
+		fb.AppliedSignals = buildAppliedSignals(sourceFeed.Feed, fb)
+	} else {
+		fb.AppliedSignals = buildExplicitSignals(fb.Tags)
+	}
 
 	if err := store.SaveFeedback(ctx, fb); err != nil {
 		return nil, ErrInternal(errors.Wrap(err, "save feedback"))
 	}
 
-	if err := store.UpdateProfileFromFeedback(ctx, fb); err != nil {
+	if err := store.ReplaceFeedbackProfile(ctx, prev, fb); err != nil {
 		return nil, ErrInternal(errors.Wrap(err, "update profile"))
+	}
+
+	if req.Archive && sourceFeed != nil {
+		if err := store.SaveArchive(ctx, archiveEntryFromFeed(sourceFeed.Feed, fb)); err != nil {
+			return nil, ErrInternal(errors.Wrap(err, "save archive"))
+		}
 	}
 
 	var matched []string
@@ -726,12 +796,31 @@ func (a *api) Archive(ctx context.Context, req *ArchiveRequest) (*ArchiveRespons
 		return nil, ErrBadRequest(err)
 	}
 
-	store := personalization.NewStore(a.Dependencies().KVStorage)
-	entry := &personalization.ArchiveEntry{
-		FeedID: req.FeedID,
+	sourceFeed, err := a.lookupFeedByID(ctx, req.FeedID)
+	if err != nil {
+		return nil, err
 	}
 
-	if err := store.SaveArchive(ctx, entry); err != nil {
+	store := personalization.NewStore(a.Dependencies().KVStorage)
+	fb, err := store.GetFeedback(ctx, req.FeedID)
+	switch {
+	case err == nil:
+	case errors.Is(err, kv.ErrNotFound):
+		fb = nil
+	default:
+		return nil, ErrInternal(errors.Wrap(err, "get feedback for archive"))
+	}
+	if req.Note != "" {
+		if fb == nil {
+			fb = &personalization.Feedback{FeedID: req.FeedID, Note: req.Note}
+		} else {
+			copied := *fb
+			copied.Note = req.Note
+			fb = &copied
+		}
+	}
+
+	if err := store.SaveArchive(ctx, archiveEntryFromFeed(sourceFeed.Feed, fb)); err != nil {
 		return nil, ErrInternal(errors.Wrap(err, "save archive"))
 	}
 
@@ -744,10 +833,8 @@ func (a *api) MarkRead(ctx context.Context, req *MarkReadRequest) (*MarkReadResp
 	}
 
 	store := personalization.NewStore(a.Dependencies().KVStorage)
-	for _, id := range req.FeedIDs {
-		if err := store.MarkRead(ctx, id); err != nil {
-			return nil, ErrInternal(errors.Wrap(err, "mark read"))
-		}
+	if err := store.MarkReadBatch(ctx, req.FeedIDs); err != nil {
+		return nil, ErrInternal(errors.Wrap(err, "mark read"))
 	}
 
 	return &MarkReadResponse{}, nil
@@ -762,6 +849,22 @@ func (a *api) GetProfile(ctx context.Context, _ *GetProfileRequest) (*GetProfile
 	}
 
 	return &GetProfileResponse{ProfileGlobal: profile}, nil
+}
+
+func (a *api) ListReads(ctx context.Context, _ *ListReadsRequest) (*ListReadsResponse, error) {
+	store := personalization.NewStore(a.Dependencies().KVStorage)
+
+	profile, err := store.GetProfile(ctx)
+	if err != nil {
+		return nil, ErrInternal(errors.Wrap(err, "get profile"))
+	}
+
+	reads := profile.ReadIndex
+	if reads == nil {
+		reads = []personalization.ReadIndexEntry{}
+	}
+
+	return &ListReadsResponse{Reads: reads, Total: len(reads)}, nil
 }
 
 func (a *api) ListArchives(ctx context.Context, _ *ListArchivesRequest) (*ListArchivesResponse, error) {
@@ -783,49 +886,276 @@ func (a *api) ListArchives(ctx context.Context, _ *ListArchivesRequest) (*ListAr
 func (a *api) ResetProfile(ctx context.Context, _ *ResetProfileRequest) (*ResetProfileResponse, error) {
 	store := personalization.NewStore(a.Dependencies().KVStorage)
 
-	if err := store.SaveProfile(ctx, &personalization.ProfileGlobal{}); err != nil {
+	if err := store.Reset(ctx); err != nil {
 		return nil, ErrInternal(errors.Wrap(err, "reset profile"))
 	}
 
 	return &ResetProfileResponse{Message: "profile reset"}, nil
 }
 
-// personalScore computes a relevance score for a feed based on the user profile.
-// Returns a value in [0.0, 1.0].
-func personalScore(feed *block.FeedVO, profile *personalization.ProfileGlobal) float64 {
-	base := 0.5
-	for _, tc := range profile.TagControls {
-		tagLower := strings.ToLower(tc.Tag)
-		matched := false
-		for _, lbl := range feed.Labels {
-			if strings.Contains(strings.ToLower(lbl.Value), tagLower) {
-				matched = true
+func (a *api) GetStats(ctx context.Context, _ *GetStatsRequest) (*GetStatsResponse, error) {
+	if a.Dependencies().StatsStore == nil {
+		return &GetStatsResponse{Snapshot: &stats.Snapshot{}}, nil
+	}
 
-				break
-			}
+	snapshot, err := a.Dependencies().StatsStore.Snapshot(ctx)
+	if err != nil {
+		return nil, ErrInternal(errors.Wrap(err, "get stats snapshot"))
+	}
+
+	return &GetStatsResponse{Snapshot: snapshot}, nil
+}
+
+const minFeedbackForPersonalization = 5
+
+// personalScore computes a relevance score for a feed based on the user profile.
+func personalScore(feed *block.FeedVO, profile *personalization.ProfileGlobal) float64 {
+	base := baseRankingScore(feed) + freshnessBoost(feed.Time)
+	candidates := personalization.FeedSignalTags(feed.Feed)
+	for _, tc := range profile.TagControls {
+		if tc.Action == personalization.TagActionBlock {
+			continue
 		}
-		if !matched {
+		if !personalization.MatchesTag(tc.Tag, candidates) {
 			continue
 		}
 
 		switch tc.Action {
 		case personalization.TagActionBoost:
-			base += tc.Weight * 0.3
+			base += tc.Weight * 0.35
 		case personalization.TagActionDemote:
-			base -= tc.Weight * 0.3
-		case personalization.TagActionBlock:
-			return 0.0
+			base -= tc.Weight * 0.35
 		}
 	}
 
-	if base > 1.0 {
-		return 1.0
-	}
-	if base < 0.0 {
-		return 0.0
+	return clampScore(base, 0, 2.5)
+}
+
+func baseRankingScore(feed *block.FeedVO) float64 {
+	if feed == nil || feed.Feed == nil {
+		return 0.6
 	}
 
-	return base
+	base := float64(personalization.BaseQualityScore(feed.Feed)) / 10
+	if feed.Score > 0 {
+		base += float64(feed.Score) * 0.15
+	}
+
+	return clampScore(base, 0, 1.5)
+}
+
+func freshnessBoost(t time.Time) float64 {
+	hours := time.Since(t).Hours()
+	switch {
+	case hours <= 6:
+		return 0.08
+	case hours <= 24:
+		return 0.04
+	case hours <= 72:
+		return 0.01
+	default:
+		return 0
+	}
+}
+
+func filterBlockedFeeds(feeds []*block.FeedVO, profile *personalization.ProfileGlobal) []*block.FeedVO {
+	filtered := feeds[:0]
+	for _, current := range feeds {
+		if isBlockedFeed(current.Feed, profile) {
+			continue
+		}
+		filtered = append(filtered, current)
+	}
+
+	return filtered
+}
+
+func isBlockedFeed(feed *model.Feed, profile *personalization.ProfileGlobal) bool {
+	if feed == nil || profile == nil {
+		return false
+	}
+
+	candidates := personalization.FeedSignalTags(feed)
+	for _, tc := range profile.TagControls {
+		if tc.Action != personalization.TagActionBlock {
+			continue
+		}
+		if personalization.MatchesTag(tc.Tag, candidates) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func matchedBoostTags(feed *model.Feed, profile *personalization.ProfileGlobal) []string {
+	if feed == nil || profile == nil {
+		return nil
+	}
+
+	candidates := personalization.FeedSignalTags(feed)
+	var matched []string
+	for _, tc := range profile.TagControls {
+		if tc.Action != personalization.TagActionBoost {
+			continue
+		}
+		if personalization.MatchesTag(tc.Tag, candidates) {
+			matched = append(matched, tc.Tag)
+		}
+	}
+	sort.Strings(matched)
+
+	return matched
+}
+
+func buildAppliedSignals(feed *model.Feed, fb *personalization.Feedback) []personalization.AppliedTagSignal {
+	signals := buildExplicitSignals(fb.Tags)
+	signals = append(signals, buildScoreSignals(feed, fb)...)
+
+	return mergeSignals(signals)
+}
+
+func buildExplicitSignals(tags []personalization.UserTag) []personalization.AppliedTagSignal {
+	signals := make([]personalization.AppliedTagSignal, 0, len(tags))
+	for _, tag := range tags {
+		if strings.TrimSpace(tag.Tag) == "" {
+			continue
+		}
+		delta := 0.6
+		if tag.Action == personalization.TagActionBlock {
+			delta = 1
+		}
+		signals = append(signals, personalization.AppliedTagSignal{
+			Tag:    strings.TrimSpace(tag.Tag),
+			Action: tag.Action,
+			Delta:  delta,
+		})
+	}
+
+	return signals
+}
+
+func buildScoreSignals(feed *model.Feed, fb *personalization.Feedback) []personalization.AppliedTagSignal {
+	if feed == nil || fb == nil || fb.Score == 0 || fb.Score == 6 {
+		return nil
+	}
+
+	for _, tag := range fb.Tags {
+		if tag.Action == personalization.TagActionBlock {
+			return nil
+		}
+	}
+
+	action, delta, ok := scoreSignalDelta(fb.Score)
+	if !ok {
+		return nil
+	}
+
+	signals := make([]personalization.AppliedTagSignal, 0, 2)
+	for _, tag := range personalization.DefaultFeedbackTags(feed) {
+		signals = append(signals, personalization.AppliedTagSignal{
+			Tag:    tag,
+			Action: action,
+			Delta:  delta,
+		})
+	}
+
+	return signals
+}
+
+func scoreSignalDelta(score int) (personalization.TagAction, float64, bool) {
+	switch {
+	case score >= 9:
+		return personalization.TagActionBoost, 0.45, true
+	case score >= 7:
+		return personalization.TagActionBoost, 0.25, true
+	case score >= 4 && score <= 5:
+		return personalization.TagActionDemote, 0.18, true
+	case score >= 1 && score <= 3:
+		return personalization.TagActionDemote, 0.35, true
+	default:
+		return "", 0, false
+	}
+}
+
+func mergeSignals(signals []personalization.AppliedTagSignal) []personalization.AppliedTagSignal {
+	if len(signals) == 0 {
+		return nil
+	}
+
+	type signalKey struct {
+		Tag    string
+		Action personalization.TagAction
+	}
+	merged := make(map[signalKey]float64, len(signals))
+	for _, signal := range signals {
+		tag := strings.TrimSpace(signal.Tag)
+		if tag == "" || signal.Delta <= 0 {
+			continue
+		}
+		merged[signalKey{Tag: tag, Action: signal.Action}] += signal.Delta
+	}
+
+	result := make([]personalization.AppliedTagSignal, 0, len(merged))
+	for key, delta := range merged {
+		result = append(result, personalization.AppliedTagSignal{
+			Tag:    key.Tag,
+			Action: key.Action,
+			Delta:  delta,
+		})
+	}
+	sort.SliceStable(result, func(i, j int) bool {
+		if result[i].Tag == result[j].Tag {
+			return result[i].Action < result[j].Action
+		}
+		return result[i].Tag < result[j].Tag
+	})
+
+	return result
+}
+
+func archiveEntryFromFeed(feed *model.Feed, fb *personalization.Feedback) *personalization.ArchiveEntry {
+	entry := &personalization.ArchiveEntry{}
+	if feed != nil {
+		entry.FeedID = strconv.FormatUint(feed.ID, 10)
+		entry.Labels = feed.Labels.Map()
+		entry.FeedTime = feed.Time
+	}
+	if fb != nil {
+		entry.FeedID = fb.FeedID
+		copied := *fb
+		entry.Feedback = &copied
+	}
+
+	return entry
+}
+
+func (a *api) lookupFeedByID(ctx context.Context, feedID string) (*block.FeedVO, error) {
+	parsed, err := strconv.ParseUint(feedID, 10, 64)
+	if err != nil {
+		return nil, ErrBadRequest(errors.New("invalid feed_id"))
+	}
+
+	feedVO, ok, err := a.Dependencies().FeedStorage.Get(ctx, parsed, time.Time{})
+	if err != nil {
+		return nil, ErrInternal(errors.Wrap(err, "lookup feed"))
+	}
+	if !ok || feedVO == nil {
+		return nil, ErrNotFound(errors.New("feed not found"))
+	}
+
+	return feedVO, nil
+}
+
+func clampScore(v, minV, maxV float64) float64 {
+	if v < minV {
+		return minV
+	}
+	if v > maxV {
+		return maxV
+	}
+
+	return v
 }
 
 type mockAPI struct {
@@ -926,6 +1256,12 @@ func (m *mockAPI) GetProfile(ctx context.Context, req *GetProfileRequest) (*GetP
 	return args.Get(0).(*GetProfileResponse), args.Error(1)
 }
 
+func (m *mockAPI) ListReads(ctx context.Context, req *ListReadsRequest) (*ListReadsResponse, error) {
+	args := m.Called(ctx, req)
+
+	return args.Get(0).(*ListReadsResponse), args.Error(1)
+}
+
 func (m *mockAPI) ListArchives(ctx context.Context, req *ListArchivesRequest) (*ListArchivesResponse, error) {
 	args := m.Called(ctx, req)
 
@@ -936,4 +1272,10 @@ func (m *mockAPI) ResetProfile(ctx context.Context, req *ResetProfileRequest) (*
 	args := m.Called(ctx, req)
 
 	return args.Get(0).(*ResetProfileResponse), args.Error(1)
+}
+
+func (m *mockAPI) GetStats(ctx context.Context, req *GetStatsRequest) (*GetStatsResponse, error) {
+	args := m.Called(ctx, req)
+
+	return args.Get(0).(*GetStatsResponse), args.Error(1)
 }

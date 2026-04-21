@@ -99,9 +99,7 @@ func (o *openaiText) String(ctx context.Context, messages []string) (value strin
 	}
 
 	lvs := []string{o.Name(), o.Instance(), "String"}
-	promptTokens.WithLabelValues(lvs...).Add(float64(resp.Usage.PromptTokens))
-	completionTokens.WithLabelValues(lvs...).Add(float64(resp.Usage.CompletionTokens))
-	totalTokens.WithLabelValues(lvs...).Add(float64(resp.Usage.TotalTokens))
+	recordTokens(lvs, resp.Usage.PromptTokens, resp.Usage.CompletionTokens, resp.Usage.TotalTokens)
 
 	return resp.Choices[0].Message.Content, nil
 }
@@ -153,9 +151,7 @@ func (o *openaiText) Embedding(ctx context.Context, s string) (value []float32, 
 	}
 
 	lvs := []string{o.Name(), o.Instance(), "Embedding"}
-	promptTokens.WithLabelValues(lvs...).Add(float64(vec.Usage.PromptTokens))
-	completionTokens.WithLabelValues(lvs...).Add(float64(vec.Usage.CompletionTokens))
-	totalTokens.WithLabelValues(lvs...).Add(float64(vec.Usage.TotalTokens))
+	recordTokens(lvs, vec.Usage.PromptTokens, vec.Usage.CompletionTokens, vec.Usage.TotalTokens)
 
 	return vec.Data[0].Embedding, nil
 }

@@ -33,6 +33,7 @@ import (
 	"github.com/glidea/zenfeed/pkg/component"
 	"github.com/glidea/zenfeed/pkg/config"
 	"github.com/glidea/zenfeed/pkg/model"
+	"github.com/glidea/zenfeed/pkg/stats"
 	"github.com/glidea/zenfeed/pkg/storage/kv"
 	"github.com/glidea/zenfeed/pkg/telemetry/log"
 	telemetrymodel "github.com/glidea/zenfeed/pkg/telemetry/model"
@@ -150,7 +151,33 @@ var (
 		},
 		[]string{telemetrymodel.KeyComponent, telemetrymodel.KeyComponentInstance, telemetrymodel.KeyOperation},
 	)
+
+	// globalStatsTracker is set once at startup by SetStatsTracker.
+	globalStatsTracker stats.Tracker
+	globalStatsMu      sync.Mutex
 )
+
+// SetStatsTracker registers a stats.Tracker that receives LLM token events.
+// Must be called before any LLM calls are made (i.e. during app startup).
+func SetStatsTracker(t stats.Tracker) {
+	globalStatsMu.Lock()
+	globalStatsTracker = t
+	globalStatsMu.Unlock()
+}
+
+// recordTokens records token usage to Prometheus and the stats tracker.
+func recordTokens(lvs []string, prompt, completion, total int) {
+	promptTokens.WithLabelValues(lvs...).Add(float64(prompt))
+	completionTokens.WithLabelValues(lvs...).Add(float64(completion))
+	totalTokens.WithLabelValues(lvs...).Add(float64(total))
+
+	globalStatsMu.Lock()
+	t := globalStatsTracker
+	globalStatsMu.Unlock()
+	if t != nil {
+		t.RecordTokens(int64(prompt), int64(completion))
+	}
+}
 
 // --- Factory code block ---
 type FactoryConfig struct {

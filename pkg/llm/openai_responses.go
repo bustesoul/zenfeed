@@ -139,9 +139,7 @@ func (o *openaiResponsesText) String(ctx context.Context, messages []string) (va
 	}
 
 	lvs := []string{o.Name(), o.Instance(), "String"}
-	promptTokens.WithLabelValues(lvs...).Add(float64(usage.InputTokens))
-	completionTokens.WithLabelValues(lvs...).Add(float64(usage.OutputTokens))
-	totalTokens.WithLabelValues(lvs...).Add(float64(usage.TotalTokens))
+	recordTokens(lvs, int(usage.InputTokens), int(usage.OutputTokens), int(usage.TotalTokens))
 
 	return fullText, nil
 }
@@ -248,9 +246,7 @@ func (o *openaiResponsesText) Embedding(ctx context.Context, s string) (value []
 	}
 
 	lvs := []string{o.Name(), o.Instance(), "Embedding"}
-	promptTokens.WithLabelValues(lvs...).Add(float64(vec.Usage.PromptTokens))
-	completionTokens.WithLabelValues(lvs...).Add(float64(vec.Usage.CompletionTokens))
-	totalTokens.WithLabelValues(lvs...).Add(float64(vec.Usage.TotalTokens))
+	recordTokens(lvs, vec.Usage.PromptTokens, vec.Usage.CompletionTokens, vec.Usage.TotalTokens)
 
 	return vec.Data[0].Embedding, nil
 }
