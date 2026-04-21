@@ -278,6 +278,7 @@ type QueryOptions struct {
 	LabelFilters []string
 	labelFilters model.LabelFilters
 	Limit        int
+	RecallLimit  int // if > Limit, use RecallLimit for heap size then re-rank
 	Start, End   time.Time
 }
 
@@ -303,6 +304,12 @@ func (q *QueryOptions) Validate() error { //nolint:cyclop
 	}
 	if q.Limit > 500 {
 		return errors.New("limit must be less than or equal to 500")
+	}
+	if q.RecallLimit > 0 && q.RecallLimit < q.Limit {
+		q.RecallLimit = q.Limit
+	}
+	if q.RecallLimit > 2500 {
+		q.RecallLimit = 2500
 	}
 	if q.Start.IsZero() {
 		q.Start = time.Now().Add(-time.Hour * 24)
@@ -339,6 +346,18 @@ func (q *QueryOptions) HitTimeRangeCondition(b Block) bool {
 
 	return queryAsBase || blockAsBase
 }
+
+// EffectiveLimit returns RecallLimit if it is greater than Limit, otherwise Limit.
+func EffectiveLimit(q QueryOptions) int {
+	if q.RecallLimit > q.Limit {
+		return q.RecallLimit
+	}
+
+	return q.Limit
+}
+
+// effectiveLimit is the unexported alias used internally.
+func effectiveLimit(q QueryOptions) int { return EffectiveLimit(q) }
 
 // --- Factory code block ---
 type Factory component.Factory[Block, Config, Dependencies]
@@ -645,7 +664,7 @@ func (b *block) Query(ctx context.Context, query QueryOptions) (feeds []*FeedVO,
 	chunks := b.chunks
 	b.mu.RUnlock()
 
-	result := NewFeedVOHeap(make(FeedVOs, 0, query.Limit))
+	result := NewFeedVOHeap(make(FeedVOs, 0, effectiveLimit(query)))
 	if err := filterResult.forEach(ctx, b.primaryIndex, func(ref primary.FeedRef, score float32) error {
 		if ref.Time.Before(query.Start) || !ref.Time.Before(query.End) {
 			return nil
@@ -1181,7 +1200,7 @@ func (b *block) applyFilters(ctx context.Context, query *QueryOptions) (res filt
 	}
 
 	// Apply vector filter.
-	vectorsResult, err := b.applyVectorFilter(ctx, query.Query, query.Threshold, query.Limit)
+	vectorsResult, err := b.applyVectorFilter(ctx, query.Query, query.Threshold, effectiveLimit(*query))
 	if err != nil {
 		return nil, errors.Wrap(err, "applying vector filter")
 	}

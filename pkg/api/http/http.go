@@ -101,6 +101,8 @@ func new(instance string, app *config.App, dependencies Dependencies) (Server, e
 	protected.Handle("/archive", jsonrpc.API(api.Archive))
 	protected.Handle("/mark_read", jsonrpc.API(api.MarkRead))
 	protected.Handle("/get_profile", jsonrpc.API(api.GetProfile))
+	protected.Handle("/list_archives", jsonrpc.API(api.ListArchives))
+	protected.Handle("/reset_profile", jsonrpc.API(api.ResetProfile))
 	router := http.NewServeMux()
 	router.Handle("/auth/login", loginHandler(authToken))
 	router.Handle("/auth/logout", logoutHandler())

@@ -395,7 +395,7 @@ func (s *storage) Query(ctx context.Context, query block.QueryOptions) (feeds []
 
 	// Parallel read.
 	blocks := s.blocks.list(nil)
-	feedHeap := block.NewFeedVOHeap(make(block.FeedVOs, 0, query.Limit))
+	feedHeap := block.NewFeedVOHeap(make(block.FeedVOs, 0, block.EffectiveLimit(query)))
 	var (
 		mu   sync.Mutex
 		wg   sync.WaitGroup

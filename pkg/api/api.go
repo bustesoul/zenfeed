@@ -22,6 +22,7 @@ import (
 	"math/rand"
 	"net/http"
 	"reflect"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -70,6 +71,8 @@ type API interface {
 	Archive(ctx context.Context, req *ArchiveRequest) (resp *ArchiveResponse, err error)
 	MarkRead(ctx context.Context, req *MarkReadRequest) (resp *MarkReadResponse, err error)
 	GetProfile(ctx context.Context, req *GetProfileRequest) (resp *GetProfileResponse, err error)
+	ListArchives(ctx context.Context, req *ListArchivesRequest) (resp *ListArchivesResponse, err error)
+	ResetProfile(ctx context.Context, req *ResetProfileRequest) (resp *ResetProfileResponse, err error)
 }
 
 type Config struct {
@@ -163,6 +166,7 @@ type QueryRequest struct {
 	LabelFilters []string  `json:"label_filters,omitempty"`
 	Summarize    bool      `json:"summarize,omitempty"`
 	Limit        int       `json:"limit,omitempty"`
+	RecallLimit  int       `json:"recall_limit,omitempty"`
 	Start        time.Time `json:"start,omitempty"`
 	End          time.Time `json:"end,omitempty"`
 }
@@ -202,9 +206,10 @@ type QueryRequestSemanticFilter struct {
 }
 
 type QueryResponse struct {
-	Summary string          `json:"summary,omitempty"`
-	Feeds   []*block.FeedVO `json:"feeds"`
-	Count   int             `json:"count"`
+	Summary            string          `json:"summary,omitempty"`
+	Feeds              []*block.FeedVO `json:"feeds"`
+	Count              int             `json:"count"`
+	MatchedPreferences []string        `json:"matched_preferences,omitempty"`
 }
 
 type FeedbackRequest struct {
@@ -264,6 +269,19 @@ type GetProfileRequest struct{}
 
 type GetProfileResponse struct {
 	*personalization.ProfileGlobal
+}
+
+type ListArchivesRequest struct{}
+
+type ListArchivesResponse struct {
+	Archives []personalization.ArchiveIndexEntry `json:"archives"`
+	Total    int                                 `json:"total"`
+}
+
+type ResetProfileRequest struct{}
+
+type ResetProfileResponse struct {
+	Message string `json:"message"`
 }
 
 type Error struct {
@@ -538,12 +556,25 @@ func (a *api) Query(ctx context.Context, req *QueryRequest) (resp *QueryResponse
 		return nil, ErrBadRequest(errors.Wrap(err, "validate"))
 	}
 
+	// Determine recall limit for candidate expansion.
+	recallLimit := req.RecallLimit
+	if recallLimit == 0 {
+		recallLimit = req.Limit * 5
+		if recallLimit < 50 {
+			recallLimit = 50
+		}
+		if recallLimit > 2500 {
+			recallLimit = 2500
+		}
+	}
+
 	// Forward to storage.
 	feeds, err := a.Dependencies().FeedStorage.Query(ctx, block.QueryOptions{
 		Query:        req.Query,
 		Threshold:    req.Threshold,
 		LabelFilters: req.LabelFilters,
 		Limit:        req.Limit,
+		RecallLimit:  recallLimit,
 		Start:        req.Start,
 		End:          req.End,
 	})
@@ -552,6 +583,44 @@ func (a *api) Query(ctx context.Context, req *QueryRequest) (resp *QueryResponse
 	}
 	if len(feeds) == 0 {
 		return &QueryResponse{Feeds: []*block.FeedVO{}}, nil
+	}
+
+	// Personal re-ranking.
+	var matchedPreferences []string
+	store := personalization.NewStore(a.Dependencies().KVStorage)
+	profile, profileErr := store.GetProfile(ctx)
+	if profileErr == nil && len(profile.TagControls) > 0 {
+		sort.Slice(feeds, func(i, j int) bool {
+			return personalScore(feeds[i], profile) > personalScore(feeds[j], profile)
+		})
+
+		// Collect boost tags matched across returned feeds (after truncation).
+		limit := req.Limit
+		if limit > len(feeds) {
+			limit = len(feeds)
+		}
+		feeds = feeds[:limit]
+
+		boostedSet := make(map[string]struct{})
+		for _, f := range feeds {
+			for _, tc := range profile.TagControls {
+				if tc.Action != personalization.TagActionBoost {
+					continue
+				}
+				tagLower := strings.ToLower(tc.Tag)
+				for _, lbl := range f.Labels {
+					if strings.Contains(strings.ToLower(lbl.Value), tagLower) {
+						boostedSet[tc.Tag] = struct{}{}
+						break
+					}
+				}
+			}
+		}
+		for tag := range boostedSet {
+			matchedPreferences = append(matchedPreferences, tag)
+		}
+	} else if len(feeds) > req.Limit {
+		feeds = feeds[:req.Limit]
 	}
 
 	// Summarize feeds.
@@ -583,9 +652,10 @@ func (a *api) Query(ctx context.Context, req *QueryRequest) (resp *QueryResponse
 	}
 
 	return &QueryResponse{
-		Summary: summary,
-		Feeds:   feeds,
-		Count:   len(feeds),
+		Summary:            summary,
+		Feeds:              feeds,
+		Count:              len(feeds),
+		MatchedPreferences: matchedPreferences,
 	}, nil
 }
 
@@ -666,6 +736,70 @@ func (a *api) GetProfile(ctx context.Context, _ *GetProfileRequest) (*GetProfile
 	}
 
 	return &GetProfileResponse{ProfileGlobal: profile}, nil
+}
+
+func (a *api) ListArchives(ctx context.Context, _ *ListArchivesRequest) (*ListArchivesResponse, error) {
+	store := personalization.NewStore(a.Dependencies().KVStorage)
+
+	profile, err := store.GetProfile(ctx)
+	if err != nil {
+		return nil, ErrInternal(errors.Wrap(err, "get profile"))
+	}
+
+	archives := profile.ArchiveIndex
+	if archives == nil {
+		archives = []personalization.ArchiveIndexEntry{}
+	}
+
+	return &ListArchivesResponse{Archives: archives, Total: len(archives)}, nil
+}
+
+func (a *api) ResetProfile(ctx context.Context, _ *ResetProfileRequest) (*ResetProfileResponse, error) {
+	store := personalization.NewStore(a.Dependencies().KVStorage)
+
+	if err := store.SaveProfile(ctx, &personalization.ProfileGlobal{}); err != nil {
+		return nil, ErrInternal(errors.Wrap(err, "reset profile"))
+	}
+
+	return &ResetProfileResponse{Message: "profile reset"}, nil
+}
+
+// personalScore computes a relevance score for a feed based on the user profile.
+// Returns a value in [0.0, 1.0].
+func personalScore(feed *block.FeedVO, profile *personalization.ProfileGlobal) float64 {
+	base := 0.5
+	for _, tc := range profile.TagControls {
+		tagLower := strings.ToLower(tc.Tag)
+		matched := false
+		for _, lbl := range feed.Labels {
+			if strings.Contains(strings.ToLower(lbl.Value), tagLower) {
+				matched = true
+
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+
+		switch tc.Action {
+		case personalization.TagActionBoost:
+			base += tc.Weight * 0.3
+		case personalization.TagActionDemote:
+			base -= tc.Weight * 0.3
+		case personalization.TagActionBlock:
+			return 0.0
+		}
+	}
+
+	if base > 1.0 {
+		return 1.0
+	}
+	if base < 0.0 {
+		return 0.0
+	}
+
+	return base
 }
 
 type mockAPI struct {
@@ -764,4 +898,16 @@ func (m *mockAPI) GetProfile(ctx context.Context, req *GetProfileRequest) (*GetP
 	args := m.Called(ctx, req)
 
 	return args.Get(0).(*GetProfileResponse), args.Error(1)
+}
+
+func (m *mockAPI) ListArchives(ctx context.Context, req *ListArchivesRequest) (*ListArchivesResponse, error) {
+	args := m.Called(ctx, req)
+
+	return args.Get(0).(*ListArchivesResponse), args.Error(1)
+}
+
+func (m *mockAPI) ResetProfile(ctx context.Context, req *ResetProfileRequest) (*ResetProfileResponse, error) {
+	args := m.Called(ctx, req)
+
+	return args.Get(0).(*ResetProfileResponse), args.Error(1)
 }

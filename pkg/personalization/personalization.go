@@ -68,13 +68,22 @@ type TagControl struct {
 	Weight float64   `json:"weight"`
 }
 
+// ArchiveIndexEntry is a lightweight record of a saved article stored inside profile:global.
+type ArchiveIndexEntry struct {
+	FeedID     string    `json:"feed_id"`
+	Title      string    `json:"title,omitempty"`
+	Source     string    `json:"source,omitempty"`
+	ArchivedAt time.Time `json:"archived_at"`
+}
+
 // ProfileGlobal is the aggregated user preference profile stored at profile:global.
 type ProfileGlobal struct {
-	TagControls      []TagControl `json:"tag_controls"`
-	FeedbackCount    int          `json:"feedback_count"`
-	LastUpdated      time.Time    `json:"last_updated"`
-	WeeklySnapshot   []TagControl `json:"weekly_snapshot,omitempty"`
-	WeeklySnapshotAt time.Time    `json:"weekly_snapshot_at,omitempty"`
+	TagControls      []TagControl        `json:"tag_controls"`
+	FeedbackCount    int                 `json:"feedback_count"`
+	LastUpdated      time.Time           `json:"last_updated"`
+	WeeklySnapshot   []TagControl        `json:"weekly_snapshot,omitempty"`
+	WeeklySnapshotAt time.Time           `json:"weekly_snapshot_at,omitempty"`
+	ArchiveIndex     []ArchiveIndexEntry `json:"archive_index,omitempty"`
 }
 
 // ArchiveEntry is the archived article stored at archive:{feed_id}.
@@ -138,6 +147,29 @@ func (s *Store) SaveArchive(ctx context.Context, entry *ArchiveEntry) error {
 
 	if err := s.kv.Set(ctx, ArchiveKey(entry.FeedID), data, 0); err != nil {
 		return errors.Wrap(err, "set archive entry")
+	}
+
+	// Maintain the lightweight archive index inside the global profile.
+	profile, err := s.GetProfile(ctx)
+	if err != nil {
+		return errors.Wrap(err, "get profile for archive index")
+	}
+
+	indexEntry := ArchiveIndexEntry{
+		FeedID:     entry.FeedID,
+		Title:      entry.Labels["title"],
+		Source:     entry.Labels["source"],
+		ArchivedAt: entry.ArchivedAt,
+	}
+	profile.ArchiveIndex = append(profile.ArchiveIndex, indexEntry)
+
+	const maxArchiveIndex = 200
+	if len(profile.ArchiveIndex) > maxArchiveIndex {
+		profile.ArchiveIndex = profile.ArchiveIndex[len(profile.ArchiveIndex)-maxArchiveIndex:]
+	}
+
+	if err := s.SaveProfile(ctx, profile); err != nil {
+		return errors.Wrap(err, "save profile after archive")
 	}
 
 	return nil
