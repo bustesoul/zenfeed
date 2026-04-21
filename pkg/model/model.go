@@ -54,7 +54,7 @@ const (
 //	 "time": "2025-01-01T00:00:00Z",
 //	}
 type Feed struct {
-	ID     uint64    `json:"-"`
+	ID     uint64    `json:"id,string"`
 	Labels Labels    `json:"labels"`
 	Time   time.Time `json:"time"`
 }

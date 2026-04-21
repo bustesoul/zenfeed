@@ -76,6 +76,22 @@ configs:
                   prompt: |
                     {{ .summary_html_snippet_for_small_model }} Respond in ${LANGUAGE:-Chinese}
               label: summary_html_snippet
+            # article_analysis uses the default LLM. Configure a separate cheaper model
+            # in the llms config (e.g. name: cheap) and reference it via llm: cheap here
+            # once you have a second model set up.
+            - transform:
+                to_text:
+                  prompt: |
+                    分析这篇文章的内容，仅返回JSON对象，不要其他任何内容：
+                    {"base_quality_score":7,"primary_topic":"技术","format":"文章","topics_json":["技术"]}
+
+                    base_quality_score: 1-10整数，评估文章质量（信息密度、深度、原创性）
+                    primary_topic: 主要话题（如 AI、Rust、创业、投资、开发工具等）
+                    format: 内容形态（快讯、深度分析、教程、观点、盘点、实战案例之一）
+                    topics_json: JSON数组，包含所有相关话题标签
+
+                    文章内容：{{ .summary_html_snippet }}
+              label: article_analysis
           embedding_llm: embed
       notify:
         channels:

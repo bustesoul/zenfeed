@@ -32,8 +32,10 @@ import (
 	"github.com/glidea/zenfeed/pkg/config"
 	"github.com/glidea/zenfeed/pkg/llm"
 	"github.com/glidea/zenfeed/pkg/model"
+	"github.com/glidea/zenfeed/pkg/personalization"
 	"github.com/glidea/zenfeed/pkg/storage/feed"
 	"github.com/glidea/zenfeed/pkg/storage/feed/block"
+	"github.com/glidea/zenfeed/pkg/storage/kv"
 	telemetry "github.com/glidea/zenfeed/pkg/telemetry"
 	telemetrymodel "github.com/glidea/zenfeed/pkg/telemetry/model"
 	jsonschema "github.com/glidea/zenfeed/pkg/util/json_schema"
@@ -63,6 +65,11 @@ type API interface {
 
 	Write(ctx context.Context, req *WriteRequest) (resp *WriteResponse, err error) // WARN: beta!!!
 	Query(ctx context.Context, req *QueryRequest) (resp *QueryResponse, err error)
+
+	Feedback(ctx context.Context, req *FeedbackRequest) (resp *FeedbackResponse, err error)
+	Archive(ctx context.Context, req *ArchiveRequest) (resp *ArchiveResponse, err error)
+	MarkRead(ctx context.Context, req *MarkReadRequest) (resp *MarkReadResponse, err error)
+	GetProfile(ctx context.Context, req *GetProfileRequest) (resp *GetProfileResponse, err error)
 }
 
 type Config struct {
@@ -87,6 +94,7 @@ type Dependencies struct {
 	ConfigManager config.Manager
 	FeedStorage   feed.Storage
 	LLMFactory    llm.Factory
+	KVStorage     kv.Storage
 }
 
 type QueryAppConfigSchemaRequest struct{}
@@ -197,6 +205,65 @@ type QueryResponse struct {
 	Summary string          `json:"summary,omitempty"`
 	Feeds   []*block.FeedVO `json:"feeds"`
 	Count   int             `json:"count"`
+}
+
+type FeedbackRequest struct {
+	FeedID      string                    `json:"feed_id"`
+	Score       int                       `json:"score,omitempty"`
+	ScoreReason string                    `json:"score_reason,omitempty"`
+	Tags        []personalization.UserTag `json:"tags,omitempty"`
+	Archive     bool                      `json:"archive,omitempty"`
+}
+
+func (r *FeedbackRequest) Validate() error {
+	if r.FeedID == "" {
+		return errors.New("feed_id is required")
+	}
+	if r.Score < 0 || r.Score > 10 {
+		return errors.New("score must be between 0 and 10")
+	}
+
+	return nil
+}
+
+type FeedbackResponse struct {
+	Message            string   `json:"message"`
+	MatchedPreferences []string `json:"matched_preferences,omitempty"`
+}
+
+type ArchiveRequest struct {
+	FeedID string `json:"feed_id"`
+	Note   string `json:"note,omitempty"`
+}
+
+func (r *ArchiveRequest) Validate() error {
+	if r.FeedID == "" {
+		return errors.New("feed_id is required")
+	}
+
+	return nil
+}
+
+type ArchiveResponse struct{}
+
+type MarkReadRequest struct {
+	FeedIDs []string `json:"feed_ids"`
+}
+
+func (r *MarkReadRequest) Validate() error {
+	if len(r.FeedIDs) == 0 {
+		return errors.New("feed_ids is required")
+	}
+
+	return nil
+}
+
+type MarkReadResponse struct{}
+
+type GetProfileRequest struct{}
+
+type GetProfileResponse struct {
+	*personalization.ProfileGlobal
 }
 
 type Error struct {
@@ -522,6 +589,85 @@ func (a *api) Query(ctx context.Context, req *QueryRequest) (resp *QueryResponse
 	}, nil
 }
 
+func (a *api) Feedback(ctx context.Context, req *FeedbackRequest) (*FeedbackResponse, error) {
+	if err := req.Validate(); err != nil {
+		return nil, ErrBadRequest(err)
+	}
+
+	store := personalization.NewStore(a.Dependencies().KVStorage)
+
+	fb := &personalization.Feedback{
+		FeedID:      req.FeedID,
+		Score:       req.Score,
+		ScoreReason: req.ScoreReason,
+		Tags:        req.Tags,
+		Archive:     req.Archive,
+	}
+
+	if err := store.SaveFeedback(ctx, fb); err != nil {
+		return nil, ErrInternal(errors.Wrap(err, "save feedback"))
+	}
+
+	if err := store.UpdateProfileFromFeedback(ctx, fb); err != nil {
+		return nil, ErrInternal(errors.Wrap(err, "update profile"))
+	}
+
+	var matched []string
+	for _, t := range req.Tags {
+		if t.Action == personalization.TagActionBoost {
+			matched = append(matched, t.Tag)
+		}
+	}
+
+	return &FeedbackResponse{
+		Message:            personalization.FeedbackToastMessage(fb),
+		MatchedPreferences: matched,
+	}, nil
+}
+
+func (a *api) Archive(ctx context.Context, req *ArchiveRequest) (*ArchiveResponse, error) {
+	if err := req.Validate(); err != nil {
+		return nil, ErrBadRequest(err)
+	}
+
+	store := personalization.NewStore(a.Dependencies().KVStorage)
+	entry := &personalization.ArchiveEntry{
+		FeedID: req.FeedID,
+	}
+
+	if err := store.SaveArchive(ctx, entry); err != nil {
+		return nil, ErrInternal(errors.Wrap(err, "save archive"))
+	}
+
+	return &ArchiveResponse{}, nil
+}
+
+func (a *api) MarkRead(ctx context.Context, req *MarkReadRequest) (*MarkReadResponse, error) {
+	if err := req.Validate(); err != nil {
+		return nil, ErrBadRequest(err)
+	}
+
+	store := personalization.NewStore(a.Dependencies().KVStorage)
+	for _, id := range req.FeedIDs {
+		if err := store.MarkRead(ctx, id); err != nil {
+			return nil, ErrInternal(errors.Wrap(err, "mark read"))
+		}
+	}
+
+	return &MarkReadResponse{}, nil
+}
+
+func (a *api) GetProfile(ctx context.Context, _ *GetProfileRequest) (*GetProfileResponse, error) {
+	store := personalization.NewStore(a.Dependencies().KVStorage)
+
+	profile, err := store.GetProfile(ctx)
+	if err != nil {
+		return nil, ErrInternal(errors.Wrap(err, "get profile"))
+	}
+
+	return &GetProfileResponse{ProfileGlobal: profile}, nil
+}
+
 type mockAPI struct {
 	component.Mock
 }
@@ -594,4 +740,28 @@ func (m *mockAPI) Write(ctx context.Context, req *WriteRequest) (resp *WriteResp
 	args := m.Called(ctx, req)
 
 	return args.Get(0).(*WriteResponse), args.Error(1)
+}
+
+func (m *mockAPI) Feedback(ctx context.Context, req *FeedbackRequest) (*FeedbackResponse, error) {
+	args := m.Called(ctx, req)
+
+	return args.Get(0).(*FeedbackResponse), args.Error(1)
+}
+
+func (m *mockAPI) Archive(ctx context.Context, req *ArchiveRequest) (*ArchiveResponse, error) {
+	args := m.Called(ctx, req)
+
+	return args.Get(0).(*ArchiveResponse), args.Error(1)
+}
+
+func (m *mockAPI) MarkRead(ctx context.Context, req *MarkReadRequest) (*MarkReadResponse, error) {
+	args := m.Called(ctx, req)
+
+	return args.Get(0).(*MarkReadResponse), args.Error(1)
+}
+
+func (m *mockAPI) GetProfile(ctx context.Context, req *GetProfileRequest) (*GetProfileResponse, error) {
+	args := m.Called(ctx, req)
+
+	return args.Get(0).(*GetProfileResponse), args.Error(1)
 }

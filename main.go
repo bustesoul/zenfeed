@@ -316,6 +316,7 @@ func (a *App) setupAPI() (err error) {
 		ConfigManager: a.configMgr,
 		FeedStorage:   a.feedStorage,
 		LLMFactory:    a.llmFactory,
+		KVStorage:     a.kvStorage,
 	})
 	if err != nil {
 		return err
