@@ -569,156 +569,25 @@ func (a *api) Query(ctx context.Context, req *QueryRequest) (resp *QueryResponse
 	ctx = telemetry.StartWith(ctx, append(a.TelemetryLabels(), telemetrymodel.KeyOperation, "Query")...)
 	defer func() { telemetry.End(ctx, err) }()
 
-	// Validate request.
 	if err := req.Validate(); err != nil {
 		return nil, ErrBadRequest(errors.Wrap(err, "validate"))
 	}
 
-	// Determine recall limit for candidate expansion.
-	recallLimit := req.RecallLimit
-	if recallLimit == 0 {
-		recallLimit = req.Limit * 5
-		if recallLimit < 50 {
-			recallLimit = 50
-		}
-		if recallLimit > 2500 {
-			recallLimit = 2500
-		}
-	}
-
-	// Forward to storage.
-	feeds, err := a.Dependencies().FeedStorage.Query(ctx, block.QueryOptions{
-		Query:        req.Query,
-		Threshold:    req.Threshold,
-		LabelFilters: req.LabelFilters,
-		Limit:        req.Limit,
-		RecallLimit:  recallLimit,
-		Start:        req.Start,
-		End:          req.End,
-	})
+	feeds, err := a.queryCandidateFeeds(ctx, req)
 	if err != nil {
 		return nil, ErrInternal(errors.Wrap(err, "query"))
 	}
 	if len(feeds) == 0 {
-		return &QueryResponse{Feeds: []*block.FeedVO{}}, nil
+		return emptyQueryResponse(), nil
 	}
 
-	// Personal filtering and re-ranking.
-	var matchedPreferences []string
-	store := personalization.NewStore(a.Dependencies().KVStorage)
-	profile, profileErr := store.GetProfile(ctx)
-	namespaceVersion := 0
-	if profileErr == nil {
-		namespaceVersion = profile.NamespaceVersion
-	}
-	unreadFeeds := feeds[:0]
-	for _, current := range feeds {
-		if store.IsReadInNamespace(ctx, namespaceVersion, strconv.FormatUint(current.ID, 10)) {
-			continue
-		}
-		unreadFeeds = append(unreadFeeds, current)
-	}
-	feeds = unreadFeeds
+	feeds, matchedPreferences := a.personalizeFeeds(ctx, feeds, req.Limit)
 	if len(feeds) == 0 {
-		return &QueryResponse{Feeds: []*block.FeedVO{}}, nil
+		return emptyQueryResponse(), nil
 	}
 
-	if profileErr == nil && len(profile.TagControls) > 0 {
-		feeds = filterBlockedFeeds(feeds, profile)
-		if len(feeds) == 0 {
-			return &QueryResponse{Feeds: []*block.FeedVO{}}, nil
-		}
-	}
-
-	limit := req.Limit
-	if limit > len(feeds) {
-		limit = len(feeds)
-	}
-
-	if profileErr == nil && profile.FeedbackCount >= minFeedbackForPersonalization && len(profile.TagControls) > 0 {
-		sort.SliceStable(feeds, func(i, j int) bool {
-			left := personalScore(feeds[i], profile)
-			right := personalScore(feeds[j], profile)
-			if left == right {
-				return feeds[i].Time.After(feeds[j].Time)
-			}
-			return left > right
-		})
-
-		// Exploration strategy (Phase 5): when we have enough feedback and enough
-		// candidates, replace ~15% of the top results with diverse tail items so
-		// the user is not stuck in a filter bubble.
-		if len(feeds) > limit {
-			topN := limit * 85 / 100 // 85 % by personal score
-			if topN < 1 {
-				topN = 1
-			}
-			exploreN := limit - topN
-			tail := feeds[topN:] // diverse candidates (lower personal score)
-			for i := len(tail) - 1; i > 0; i-- {
-				j := rand.Intn(i + 1)
-				tail[i], tail[j] = tail[j], tail[i]
-			}
-			if exploreN > len(tail) {
-				exploreN = len(tail)
-			}
-			feeds = append(feeds[:topN], tail[:exploreN]...)
-		} else {
-			feeds = feeds[:limit]
-		}
-
-		boostedSet := make(map[string]struct{})
-		for _, current := range feeds {
-			current.MatchedPreferences = matchedBoostTags(current.Feed, profile)
-			for _, tag := range current.MatchedPreferences {
-				boostedSet[tag] = struct{}{}
-			}
-		}
-		for tag := range boostedSet {
-			matchedPreferences = append(matchedPreferences, tag)
-		}
-		sort.Strings(matchedPreferences)
-	} else {
-		sort.SliceStable(feeds, func(i, j int) bool {
-			left := baseRankingScore(feeds[i])
-			right := baseRankingScore(feeds[j])
-			if left == right {
-				return feeds[i].Time.After(feeds[j].Time)
-			}
-			return left > right
-		})
-		if len(feeds) > req.Limit {
-			feeds = feeds[:req.Limit]
-		}
-	}
-
-	// Summarize feeds.
-	var summary string
-	if req.Summarize {
-		var sb strings.Builder
-		for _, feed := range feeds {
-			sb.WriteString(feed.Labels.Get(model.LabelContent) + "\n")
-		}
-
-		q := []string{
-			"You are a helpful assistant that summarizes the following feeds.",
-			sb.String(),
-		}
-		if req.Query != "" {
-			q = append(q, "And my specific question & requirements are: "+req.Query)
-			q = append(q, "Respond in query's original language.")
-		}
-
-		summary, err = a.Dependencies().LLMFactory.Get(a.Config().LLM).String(ctx, q)
-		if err != nil {
-			summary = err.Error()
-		}
-	}
-
-	// Convert to response.
-	for _, feed := range feeds {
-		feed.Time = feed.Time.In(time.Local)
-	}
+	summary := a.summarizeFeeds(ctx, req, feeds)
+	localizeFeedTimes(feeds)
 
 	return &QueryResponse{
 		Summary:            summary,
@@ -728,7 +597,188 @@ func (a *api) Query(ctx context.Context, req *QueryRequest) (resp *QueryResponse
 	}, nil
 }
 
-func (a *api) Feedback(ctx context.Context, req *FeedbackRequest) (*FeedbackResponse, error) {
+func (a *api) queryCandidateFeeds(ctx context.Context, req *QueryRequest) ([]*block.FeedVO, error) {
+	return a.Dependencies().FeedStorage.Query(ctx, block.QueryOptions{
+		Query:        req.Query,
+		Threshold:    req.Threshold,
+		LabelFilters: req.LabelFilters,
+		Limit:        req.Limit,
+		RecallLimit:  resolveRecallLimit(req),
+		Start:        req.Start,
+		End:          req.End,
+	})
+}
+
+func resolveRecallLimit(req *QueryRequest) int {
+	recallLimit := req.RecallLimit
+	if recallLimit == 0 {
+		recallLimit = req.Limit * 5
+	}
+	if recallLimit < 50 {
+		recallLimit = 50
+	}
+	if recallLimit > 2500 {
+		recallLimit = 2500
+	}
+
+	return recallLimit
+}
+
+func emptyQueryResponse() *QueryResponse {
+	return &QueryResponse{Feeds: []*block.FeedVO{}}
+}
+
+func (a *api) personalizeFeeds(
+	ctx context.Context, feeds []*block.FeedVO, limit int,
+) ([]*block.FeedVO, []string) {
+	store := personalization.NewStore(a.Dependencies().KVStorage)
+	profile, profileErr := store.GetProfile(ctx)
+	namespaceVersion := 0
+	if profileErr == nil {
+		namespaceVersion = profile.NamespaceVersion
+	}
+
+	feeds = filterReadFeeds(ctx, store, feeds, namespaceVersion)
+	if len(feeds) == 0 {
+		return feeds, nil
+	}
+	if profileErr != nil || len(profile.TagControls) == 0 {
+		return rankFeedsWithoutPersonalization(feeds, limit), nil
+	}
+
+	feeds = filterBlockedFeeds(feeds, profile)
+	if len(feeds) == 0 {
+		return feeds, nil
+	}
+	if profile.FeedbackCount < minFeedbackForPersonalization {
+		return rankFeedsWithoutPersonalization(feeds, limit), nil
+	}
+
+	return rankFeedsWithPersonalization(feeds, profile, limit)
+}
+
+func filterReadFeeds(
+	ctx context.Context, store *personalization.Store, feeds []*block.FeedVO, namespaceVersion int,
+) []*block.FeedVO {
+	unreadFeeds := feeds[:0]
+	for _, current := range feeds {
+		if store.IsReadInNamespace(ctx, namespaceVersion, strconv.FormatUint(current.ID, 10)) {
+			continue
+		}
+		unreadFeeds = append(unreadFeeds, current)
+	}
+
+	return unreadFeeds
+}
+
+func rankFeedsWithoutPersonalization(feeds []*block.FeedVO, limit int) []*block.FeedVO {
+	sort.SliceStable(feeds, func(i, j int) bool {
+		left := baseRankingScore(feeds[i])
+		right := baseRankingScore(feeds[j])
+		if left == right {
+			return feeds[i].Time.After(feeds[j].Time)
+		}
+
+		return left > right
+	})
+	if len(feeds) > limit {
+		return feeds[:limit]
+	}
+
+	return feeds
+}
+
+func rankFeedsWithPersonalization(
+	feeds []*block.FeedVO, profile *personalization.ProfileGlobal, limit int,
+) ([]*block.FeedVO, []string) {
+	sort.SliceStable(feeds, func(i, j int) bool {
+		left := personalScore(feeds[i], profile)
+		right := personalScore(feeds[j], profile)
+		if left == right {
+			return feeds[i].Time.After(feeds[j].Time)
+		}
+
+		return left > right
+	})
+
+	feeds = applyExploration(feeds, limit)
+
+	boostedSet := make(map[string]struct{})
+	for _, current := range feeds {
+		current.MatchedPreferences = matchedBoostTags(current.Feed, profile)
+		for _, tag := range current.MatchedPreferences {
+			boostedSet[tag] = struct{}{}
+		}
+	}
+
+	matchedPreferences := make([]string, 0, len(boostedSet))
+	for tag := range boostedSet {
+		matchedPreferences = append(matchedPreferences, tag)
+	}
+	sort.Strings(matchedPreferences)
+
+	return feeds, matchedPreferences
+}
+
+func applyExploration(feeds []*block.FeedVO, limit int) []*block.FeedVO {
+	if limit > len(feeds) {
+		limit = len(feeds)
+	}
+	if len(feeds) <= limit {
+		return feeds[:limit]
+	}
+
+	topN := limit * 85 / 100
+	if topN < 1 {
+		topN = 1
+	}
+	exploreN := limit - topN
+	tail := feeds[topN:]
+	for i := len(tail) - 1; i > 0; i-- {
+		j := rand.Intn(i + 1)
+		tail[i], tail[j] = tail[j], tail[i]
+	}
+	if exploreN > len(tail) {
+		exploreN = len(tail)
+	}
+
+	return append(feeds[:topN], tail[:exploreN]...)
+}
+
+func (a *api) summarizeFeeds(ctx context.Context, req *QueryRequest, feeds []*block.FeedVO) string {
+	if !req.Summarize {
+		return ""
+	}
+
+	var sb strings.Builder
+	for _, feed := range feeds {
+		sb.WriteString(feed.Labels.Get(model.LabelContent) + "\n")
+	}
+
+	prompt := []string{
+		"You are a helpful assistant that summarizes the following feeds.",
+		sb.String(),
+	}
+	if req.Query != "" {
+		prompt = append(prompt, "And my specific question & requirements are: "+req.Query)
+		prompt = append(prompt, "Respond in query's original language.")
+	}
+
+	summary, err := a.Dependencies().LLMFactory.Get(a.Config().LLM).String(ctx, prompt)
+	if err != nil {
+		return err.Error()
+	}
+
+	return summary
+}
+
+func localizeFeedTimes(feeds []*block.FeedVO) {
+	for _, feed := range feeds {
+		feed.Time = feed.Time.In(time.Local)
+	}
+}
+
+func (a *api) Feedback(ctx context.Context, req *FeedbackRequest) (*FeedbackResponse, error) { //nolint:gocognit,cyclop
 	if err := req.Validate(); err != nil {
 		return nil, ErrBadRequest(err)
 	}
@@ -1108,6 +1158,7 @@ func mergeSignals(signals []personalization.AppliedTagSignal) []personalization.
 		if result[i].Tag == result[j].Tag {
 			return result[i].Action < result[j].Action
 		}
+
 		return result[i].Tag < result[j].Tag
 	})
 

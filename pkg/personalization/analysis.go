@@ -139,6 +139,7 @@ func splitLooseTags(raw string) []string {
 	if raw == "" {
 		return nil
 	}
+
 	return strings.FieldsFunc(raw, func(r rune) bool {
 		switch r {
 		case ',', '，', ';', '；', '|', '\n', '\t':

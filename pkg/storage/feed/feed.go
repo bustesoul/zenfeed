@@ -441,22 +441,37 @@ func (s *storage) Query(ctx context.Context, query block.QueryOptions) (feeds []
 
 func (s *storage) Get(ctx context.Context, id uint64, hintTime time.Time) (*block.FeedVO, bool, error) {
 	if !hintTime.IsZero() {
-		b, ok := s.blocks.get(hintTime)
-		if ok {
-			feed, found, err := b.Get(ctx, id)
-			if err != nil {
-				return nil, false, err
-			}
-			if found {
-				return feed, true, nil
-			}
+		feed, found, err := s.getFromHintBlock(ctx, id, hintTime)
+		switch {
+		case err != nil:
+			return nil, false, err
+		case found:
+			return feed, true, nil
 		}
 	}
 
+	return s.getFromOtherBlocks(ctx, id, hintTime)
+}
+
+func (s *storage) getFromHintBlock(
+	ctx context.Context, id uint64, hintTime time.Time,
+) (*block.FeedVO, bool, error) {
+	b, ok := s.blocks.get(hintTime)
+	if !ok {
+		return nil, false, nil
+	}
+
+	return b.Get(ctx, id)
+}
+
+func (s *storage) getFromOtherBlocks(
+	ctx context.Context, id uint64, hintTime time.Time,
+) (*block.FeedVO, bool, error) {
 	for _, b := range s.blocks.list(nil) {
 		if !hintTime.IsZero() && timeutil.InRange(hintTime, b.Start(), b.End()) {
 			continue
 		}
+
 		feed, found, err := b.Get(ctx, id)
 		if err != nil {
 			return nil, false, err

@@ -284,7 +284,7 @@ type QueryOptions struct {
 	Start, End   time.Time
 }
 
-func (q *QueryOptions) Validate() error { //nolint:cyclop
+func (q *QueryOptions) Validate() error { //nolint:cyclop,gocognit
 	if q.Threshold < 0 || q.Threshold > 1 {
 		return errors.New("threshold must be between 0 and 1")
 	}

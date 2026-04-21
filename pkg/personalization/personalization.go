@@ -342,12 +342,14 @@ func applyTagDecay(profile *ProfileGlobal) {
 	for _, tc := range profile.TagControls {
 		if tc.LastSeen.IsZero() {
 			kept = append(kept, tc)
+
 			continue
 		}
 
 		days := now.Sub(tc.LastSeen).Hours() / 24
 		if days < decayStartDays {
 			kept = append(kept, tc)
+
 			continue
 		}
 
@@ -402,7 +404,7 @@ func (s *Store) Reset(ctx context.Context) error {
 // ReplaceFeedbackProfile applies a feedback update using read-modify-write.
 // If prev is non-nil, its applied signals are removed before next is added.
 // FeedbackCount tracks unique feedback articles rather than submission times.
-func (s *Store) ReplaceFeedbackProfile(ctx context.Context, prev, next *Feedback) error {
+func (s *Store) ReplaceFeedbackProfile(ctx context.Context, prev, next *Feedback) error { //nolint:cyclop
 	profile, err := s.GetProfile(ctx)
 	if err != nil {
 		return errors.Wrap(err, "get profile")
@@ -485,18 +487,21 @@ func mergeSignedTagControl(profile *ProfileGlobal, tag string, delta float64) {
 			if delta > 0 {
 				profile.TagControls[i].LastSeen = time.Now()
 			}
+
 			return
 		}
 
 		next := signedWeight(tc) + delta
 		if math.Abs(next) < 0.05 {
 			profile.TagControls = append(profile.TagControls[:i], profile.TagControls[i+1:]...)
+
 			return
 		}
 
 		profile.TagControls[i].Action = actionFromSignedWeight(next)
 		profile.TagControls[i].Weight = clampWeight(math.Abs(next))
 		profile.TagControls[i].LastSeen = time.Now()
+
 		return
 	}
 
@@ -519,12 +524,14 @@ func mergeBlockTagControl(profile *ProfileGlobal, tag string, enable bool) {
 		}
 		if !enable {
 			profile.TagControls = append(profile.TagControls[:i], profile.TagControls[i+1:]...)
+
 			return
 		}
 
 		profile.TagControls[i].Action = TagActionBlock
 		profile.TagControls[i].Weight = 1
 		profile.TagControls[i].LastSeen = time.Now()
+
 		return
 	}
 
@@ -555,6 +562,7 @@ func actionFromSignedWeight(weight float64) TagAction {
 	if weight < 0 {
 		return TagActionDemote
 	}
+
 	return TagActionBoost
 }
 
@@ -666,6 +674,7 @@ func upsertArchiveIndex(entries []ArchiveIndexEntry, next ArchiveIndexEntry) []A
 	for _, current := range entries {
 		if current.FeedID != next.FeedID {
 			deduped = append(deduped, current)
+
 			continue
 		}
 
@@ -685,6 +694,7 @@ func upsertReadIndex(entries []ReadIndexEntry, next ReadIndexEntry) []ReadIndexE
 	for _, current := range entries {
 		if current.FeedID != next.FeedID {
 			deduped = append(deduped, current)
+
 			continue
 		}
 

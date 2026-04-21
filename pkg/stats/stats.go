@@ -142,6 +142,7 @@ func (s *Store) Snapshot(ctx context.Context) (*Snapshot, error) {
 		if sources[i].Name == sources[j].Name {
 			return sources[i].URL < sources[j].URL
 		}
+
 		return sources[i].Name < sources[j].Name
 	})
 
