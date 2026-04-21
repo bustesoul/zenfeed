@@ -146,14 +146,76 @@ func (o *openaiResponsesText) String(ctx context.Context, messages []string) (va
 
 func parseResponsesSSE(body io.Reader) (string, responsesUsage, error) {
 	var (
-		fullText  string
-		usage     responsesUsage
 		eventType string
+		dataLines []string
+		text      strings.Builder
+		usage     responsesUsage
+		sawDelta  bool
 	)
 
 	scanner := bufio.NewScanner(body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
+	flushEvent := func() {
+		if len(dataLines) == 0 {
+			eventType = ""
+
+			return
+		}
+
+		data := strings.Join(dataLines, "\n")
+		dataLines = dataLines[:0]
+
+		if data == "[DONE]" {
+			eventType = ""
+
+			return
+		}
+
+		switch eventType {
+		case "response.output_text.delta":
+			var ev struct {
+				Delta string `json:"delta"`
+			}
+			if json.Unmarshal([]byte(data), &ev) == nil {
+				text.WriteString(ev.Delta)
+				sawDelta = true
+			}
+		case "response.output_text.done":
+			var ev struct {
+				Text string `json:"text"`
+			}
+			if json.Unmarshal([]byte(data), &ev) == nil && !sawDelta {
+				text.WriteString(ev.Text)
+			}
+		case "response.completed":
+			var ev struct {
+				Response struct {
+					Usage responsesUsage `json:"usage"`
+				} `json:"response"`
+				Usage responsesUsage `json:"usage"`
+			}
+			if json.Unmarshal([]byte(data), &ev) == nil {
+				if ev.Response.Usage.TotalTokens > 0 || ev.Response.Usage.InputTokens > 0 || ev.Response.Usage.OutputTokens > 0 {
+					usage = ev.Response.Usage
+				} else {
+					usage = ev.Usage
+				}
+			}
+		}
+
+		eventType = ""
+	}
+
 	for scanner.Scan() {
 		line := scanner.Text()
+		if line == "" {
+			flushEvent()
+
+			continue
+		}
+		if strings.HasPrefix(line, ":") {
+			continue
+		}
 
 		if strings.HasPrefix(line, "event: ") {
 			eventType = strings.TrimPrefix(line, "event: ")
@@ -165,33 +227,15 @@ func parseResponsesSSE(body io.Reader) (string, responsesUsage, error) {
 			continue
 		}
 
-		data := strings.TrimPrefix(line, "data: ")
-
-		switch eventType {
-		case "response.output_text.done":
-			var ev struct {
-				Text string `json:"text"`
-			}
-			if json.Unmarshal([]byte(data), &ev) == nil {
-				fullText = ev.Text
-			}
-
-		case "response.completed":
-			var ev struct {
-				Response struct {
-					Usage responsesUsage `json:"usage"`
-				} `json:"response"`
-			}
-			if json.Unmarshal([]byte(data), &ev) == nil {
-				usage = ev.Response.Usage
-			}
-		}
+		dataLines = append(dataLines, strings.TrimPrefix(line, "data: "))
 	}
+	flushEvent()
 
 	if err := scanner.Err(); err != nil {
 		return "", responsesUsage{}, errors.Wrap(err, "read SSE stream")
 	}
 
+	fullText := text.String()
 	if fullText == "" {
 		return "", responsesUsage{}, errors.New("no text content in responses stream")
 	}

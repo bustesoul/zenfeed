@@ -16,6 +16,7 @@
 package kv
 
 import (
+	"bytes"
 	"context"
 	"strings"
 	"time"
@@ -34,6 +35,8 @@ type Storage interface {
 	component.Component
 	Get(ctx context.Context, key []byte) ([]byte, error)
 	Set(ctx context.Context, key []byte, value []byte, ttl time.Duration) error
+	Delete(ctx context.Context, key []byte) error
+	Keys(ctx context.Context, prefix []byte) ([][]byte, error)
 }
 
 var ErrNotFound = errors.New("not found")
@@ -176,6 +179,54 @@ func (k *kv) Set(ctx context.Context, key []byte, value []byte, ttl time.Duratio
 	})
 }
 
+func (k *kv) Delete(ctx context.Context, key []byte) (err error) {
+	ctx = telemetry.StartWith(ctx, append(k.TelemetryLabels(), telemetrymodel.KeyOperation, "Delete")...)
+	defer func() { telemetry.End(ctx, err) }()
+
+	err = k.db.Update(func(tx *nutsdb.Tx) error {
+		return tx.Delete(bucket, key)
+	})
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, nutsdb.ErrKeyNotFound):
+		return nil
+	case strings.Contains(err.Error(), "key not found"):
+		return nil
+	default:
+		return err
+	}
+}
+
+func (k *kv) Keys(ctx context.Context, prefix []byte) (keys [][]byte, err error) {
+	ctx = telemetry.StartWith(ctx, append(k.TelemetryLabels(), telemetrymodel.KeyOperation, "Keys")...)
+	defer func() { telemetry.End(ctx, err) }()
+
+	var allKeys [][]byte
+	err = k.db.View(func(tx *nutsdb.Tx) error {
+		var txErr error
+		allKeys, txErr = tx.GetKeys(bucket)
+
+		return txErr
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	keys = make([][]byte, 0, len(allKeys))
+	for _, key := range allKeys {
+		if len(prefix) > 0 && !bytes.HasPrefix(key, prefix) {
+			continue
+		}
+
+		copied := make([]byte, len(key))
+		copy(copied, key)
+		keys = append(keys, copied)
+	}
+
+	return keys, nil
+}
+
 type mockKV struct {
 	component.Mock
 }
@@ -190,4 +241,19 @@ func (m *mockKV) Set(ctx context.Context, key []byte, value []byte, ttl time.Dur
 	args := m.Called(ctx, key, value, ttl)
 
 	return args.Error(0)
+}
+
+func (m *mockKV) Delete(ctx context.Context, key []byte) error {
+	args := m.Called(ctx, key)
+
+	return args.Error(0)
+}
+
+func (m *mockKV) Keys(ctx context.Context, prefix []byte) ([][]byte, error) {
+	args := m.Called(ctx, prefix)
+	if value := args.Get(0); value != nil {
+		return value.([][]byte), args.Error(1)
+	}
+
+	return nil, args.Error(1)
 }

@@ -3,6 +3,7 @@ package stats
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -49,6 +50,30 @@ func (m *memoryKV) Set(_ context.Context, key []byte, value []byte, _ time.Durat
 	m.data[string(key)] = copied
 
 	return nil
+}
+
+func (m *memoryKV) Delete(_ context.Context, key []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	delete(m.data, string(key))
+
+	return nil
+}
+
+func (m *memoryKV) Keys(_ context.Context, prefix []byte) ([][]byte, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	keys := make([][]byte, 0, len(m.data))
+	for key := range m.data {
+		if len(prefix) > 0 && !strings.HasPrefix(key, string(prefix)) {
+			continue
+		}
+		keys = append(keys, []byte(key))
+	}
+
+	return keys, nil
 }
 
 func TestPersistIgnoresStaleSnapshot(t *testing.T) {

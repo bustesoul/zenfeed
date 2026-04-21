@@ -2,6 +2,7 @@ package personalization
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -49,6 +50,30 @@ func (m *memoryKV) Set(_ context.Context, key []byte, value []byte, _ time.Durat
 	m.data[string(key)] = copied
 
 	return nil
+}
+
+func (m *memoryKV) Delete(_ context.Context, key []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	delete(m.data, string(key))
+
+	return nil
+}
+
+func (m *memoryKV) Keys(_ context.Context, prefix []byte) ([][]byte, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	keys := make([][]byte, 0, len(m.data))
+	for key := range m.data {
+		if len(prefix) > 0 && !strings.HasPrefix(key, string(prefix)) {
+			continue
+		}
+		keys = append(keys, []byte(key))
+	}
+
+	return keys, nil
 }
 
 func TestReplaceFeedbackProfileReplacesSignalsWithoutInflatingCount(t *testing.T) {
@@ -209,5 +234,47 @@ func TestResetAdvancesNamespaceAndHidesLegacyHistory(t *testing.T) {
 	}
 	if _, err := store.GetArchive(ctx, "1"); !errors.Is(err, kv.ErrNotFound) {
 		t.Fatalf("get archive after reset error = %v, want kv.ErrNotFound", err)
+	}
+}
+
+func TestResetDeletesCurrentNamespaceKeys(t *testing.T) {
+	t.Parallel()
+
+	kvStore := newMemoryKV()
+	store := NewStore(kvStore)
+	ctx := context.Background()
+
+	if err := store.Reset(ctx); err != nil {
+		t.Fatalf("advance namespace: %v", err)
+	}
+	if err := store.MarkRead(ctx, "1"); err != nil {
+		t.Fatalf("mark read in versioned namespace: %v", err)
+	}
+	if err := store.SaveFeedback(ctx, &Feedback{
+		FeedID: "1",
+		Tags: []UserTag{
+			{Tag: "AI/工具", Action: TagActionBoost},
+		},
+	}); err != nil {
+		t.Fatalf("save feedback in versioned namespace: %v", err)
+	}
+	if err := store.SaveArchive(ctx, &ArchiveEntry{
+		FeedID:   "1",
+		Labels:   map[string]string{"title": "Versioned"},
+		FeedTime: time.Now(),
+	}); err != nil {
+		t.Fatalf("save archive in versioned namespace: %v", err)
+	}
+
+	if err := store.Reset(ctx); err != nil {
+		t.Fatalf("reset with cleanup: %v", err)
+	}
+
+	for key := range kvStore.data {
+		if strings.HasPrefix(key, "feedback:v1:") ||
+			strings.HasPrefix(key, "archive:v1:") ||
+			strings.HasPrefix(key, "read:v1:") {
+			t.Fatalf("expected reset to delete namespace v1 key, found %q", key)
+		}
 	}
 }

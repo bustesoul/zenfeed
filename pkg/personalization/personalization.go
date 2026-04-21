@@ -307,9 +307,13 @@ func (s *Store) IsReadInNamespace(ctx context.Context, namespace int, feedID str
 
 func (s *Store) GetProfile(ctx context.Context) (*ProfileGlobal, error) {
 	data, err := s.kv.Get(ctx, []byte(ProfileGlobalKey))
-	if err != nil {
+	switch {
+	case err == nil:
+	case errors.Is(err, kv.ErrNotFound):
 		// Return empty profile on first use.
 		return &ProfileGlobal{}, nil
+	default:
+		return nil, errors.Wrap(err, "get profile")
 	}
 
 	var profile ProfileGlobal
@@ -381,9 +385,18 @@ func (s *Store) Reset(ctx context.Context) error {
 		return errors.Wrap(err, "get profile before reset")
 	}
 
-	return s.SaveProfile(ctx, &ProfileGlobal{
+	oldNamespace := profile.NamespaceVersion
+	if err := s.SaveProfile(ctx, &ProfileGlobal{
 		NamespaceVersion: profile.NamespaceVersion + 1,
-	})
+	}); err != nil {
+		return err
+	}
+
+	if err := s.deleteNamespaceData(ctx, oldNamespace); err != nil {
+		return errors.Wrap(err, "delete namespace data")
+	}
+
+	return nil
 }
 
 // ReplaceFeedbackProfile applies a feedback update using read-modify-write.
@@ -614,6 +627,37 @@ func namespacedKey(prefix string, namespace int, feedID string) []byte {
 	}
 
 	return []byte(fmt.Sprintf("%s:v%d:%s", prefix, namespace, feedID))
+}
+
+func namespacedPrefix(prefix string, namespace int) []byte {
+	if namespace <= 0 {
+		return []byte(prefix + ":")
+	}
+
+	return []byte(fmt.Sprintf("%s:v%d:", prefix, namespace))
+}
+
+func (s *Store) deleteNamespaceData(ctx context.Context, namespace int) error {
+	prefixes := [][]byte{
+		namespacedPrefix("feedback", namespace),
+		namespacedPrefix("archive", namespace),
+		namespacedPrefix("read", namespace),
+	}
+
+	for _, prefix := range prefixes {
+		keys, err := s.kv.Keys(ctx, prefix)
+		if err != nil {
+			return errors.Wrapf(err, "list keys for prefix %s", prefix)
+		}
+
+		for _, key := range keys {
+			if err := s.kv.Delete(ctx, key); err != nil {
+				return errors.Wrapf(err, "delete key %s", key)
+			}
+		}
+	}
+
+	return nil
 }
 
 func upsertArchiveIndex(entries []ArchiveIndexEntry, next ArchiveIndexEntry) []ArchiveIndexEntry {
