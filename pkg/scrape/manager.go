@@ -157,6 +157,8 @@ func (m *manager) Run() (err error) {
 	defer func() { telemetry.End(ctx, err) }()
 
 	for _, s := range m.scrapers {
+		m.loadSourceStats(s.Config())
+
 		if err := component.RunUntilReady(ctx, s, 10*time.Second); err != nil {
 			return errors.Wrapf(err, "running scraper %s", s.Config().Name)
 		}
@@ -192,14 +194,6 @@ func (m *manager) Close() error {
 }
 
 func (m *manager) newScraper(c *scraper.Config) (scraper.Scraper, error) {
-	if st := m.Dependencies().Stats; st != nil {
-		url := ""
-		if c.RSS != nil {
-			url = c.RSS.URL
-		}
-		st.LoadSource(m.Context(), c.Name, url)
-	}
-
 	return m.Dependencies().ScraperFactory.New(
 		c.Name,
 		c,
@@ -266,6 +260,8 @@ func (m *manager) runOrRestartScraper(c *scraper.Config, newScrapers map[string]
 			return errors.Wrap(err, "creating")
 		}
 		newScrapers[c.Name] = s
+
+		m.loadSourceStats(c)
 		if err := component.RunUntilReady(m.Context(), s, 10*time.Second); err != nil {
 			return errors.Wrap(err, "running")
 		}
@@ -294,6 +290,20 @@ func (m *manager) stopAllScrapers() error {
 	}
 
 	return nil
+}
+
+func (m *manager) loadSourceStats(c *scraper.Config) {
+	if st := m.Dependencies().Stats; st != nil {
+		st.LoadSource(m.Context(), c.Name, sourceURL(c))
+	}
+}
+
+func sourceURL(c *scraper.Config) string {
+	if c.RSS != nil {
+		return c.RSS.URL
+	}
+
+	return ""
 }
 
 type mockManager struct {

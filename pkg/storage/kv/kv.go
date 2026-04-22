@@ -40,6 +40,7 @@ type Storage interface {
 }
 
 var ErrNotFound = errors.New("not found")
+var errDBNotReady = errors.New("kv db not ready")
 
 type Config struct {
 	Dir string
@@ -134,6 +135,9 @@ func (k *kv) Close() error {
 	if err := k.Base.Close(); err != nil {
 		return errors.Wrap(err, "close base")
 	}
+	if k.db == nil {
+		return nil
+	}
 
 	return k.db.Close()
 }
@@ -152,8 +156,13 @@ func (k *kv) Get(ctx context.Context, key []byte) (value []byte, err error) {
 		}())
 	}()
 
+	db, err := k.dbOrErr()
+	if err != nil {
+		return nil, err
+	}
+
 	var b []byte
-	err = k.db.View(func(tx *nutsdb.Tx) error {
+	err = db.View(func(tx *nutsdb.Tx) error {
 		b, err = tx.Get(bucket, []byte(key))
 
 		return err
@@ -174,7 +183,12 @@ func (k *kv) Set(ctx context.Context, key []byte, value []byte, ttl time.Duratio
 	ctx = telemetry.StartWith(ctx, append(k.TelemetryLabels(), telemetrymodel.KeyOperation, "Set")...)
 	defer func() { telemetry.End(ctx, err) }()
 
-	return k.db.Update(func(tx *nutsdb.Tx) error {
+	db, err := k.dbOrErr()
+	if err != nil {
+		return err
+	}
+
+	return db.Update(func(tx *nutsdb.Tx) error {
 		return tx.Put(bucket, key, value, uint32(ttl.Seconds()))
 	})
 }
@@ -183,7 +197,12 @@ func (k *kv) Delete(ctx context.Context, key []byte) (err error) {
 	ctx = telemetry.StartWith(ctx, append(k.TelemetryLabels(), telemetrymodel.KeyOperation, "Delete")...)
 	defer func() { telemetry.End(ctx, err) }()
 
-	err = k.db.Update(func(tx *nutsdb.Tx) error {
+	db, err := k.dbOrErr()
+	if err != nil {
+		return err
+	}
+
+	err = db.Update(func(tx *nutsdb.Tx) error {
 		return tx.Delete(bucket, key)
 	})
 	switch {
@@ -202,8 +221,13 @@ func (k *kv) Keys(ctx context.Context, prefix []byte) (keys [][]byte, err error)
 	ctx = telemetry.StartWith(ctx, append(k.TelemetryLabels(), telemetrymodel.KeyOperation, "Keys")...)
 	defer func() { telemetry.End(ctx, err) }()
 
+	db, err := k.dbOrErr()
+	if err != nil {
+		return nil, err
+	}
+
 	var allKeys [][]byte
-	err = k.db.View(func(tx *nutsdb.Tx) error {
+	err = db.View(func(tx *nutsdb.Tx) error {
 		var txErr error
 		allKeys, txErr = tx.GetKeys(bucket)
 
@@ -225,6 +249,14 @@ func (k *kv) Keys(ctx context.Context, prefix []byte) (keys [][]byte, err error)
 	}
 
 	return keys, nil
+}
+
+func (k *kv) dbOrErr() (*nutsdb.DB, error) {
+	if k.db == nil {
+		return nil, errDBNotReady
+	}
+
+	return k.db, nil
 }
 
 type mockKV struct {

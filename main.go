@@ -444,10 +444,9 @@ func (a *App) run(ctx context.Context) error {
 	log.Info(ctx, "starting application components...")
 	if err := component.Run(ctx,
 		component.Group{a.configMgr},
-		component.Group{a.llmFactory, a.objectStorage, a.telemetry},
+		component.Group{a.kvStorage, a.llmFactory, a.objectStorage, a.telemetry},
 		component.Group{a.rewriter},
 		component.Group{a.feedStorage},
-		component.Group{a.kvStorage},
 		component.Group{a.notifier, a.api},
 		component.Group{a.http, a.mcp, a.rss, a.scraperMgr, a.scheduler},
 	); err != nil && !errors.Is(err, context.Canceled) {

@@ -15,6 +15,76 @@
 
 package scrape
 
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/glidea/zenfeed/pkg/component"
+	"github.com/glidea/zenfeed/pkg/config"
+	"github.com/glidea/zenfeed/pkg/scrape/scraper"
+	"github.com/glidea/zenfeed/pkg/stats"
+	timeutil "github.com/glidea/zenfeed/pkg/util/time"
+)
+
+type panicKV struct{}
+
+func (p *panicKV) Name() string           { return "panicKV" }
+func (p *panicKV) Instance() string       { return "panic" }
+func (p *panicKV) Run() error             { return nil }
+func (p *panicKV) Ready() <-chan struct{} { ch := make(chan struct{}); close(ch); return ch }
+func (p *panicKV) Close() error           { return nil }
+
+func (p *panicKV) Get(context.Context, []byte) ([]byte, error) {
+	panic("kv Get should not be called during scrape manager construction")
+}
+
+func (p *panicKV) Set(context.Context, []byte, []byte, time.Duration) error {
+	return nil
+}
+
+func (p *panicKV) Delete(context.Context, []byte) error {
+	return nil
+}
+
+func (p *panicKV) Keys(context.Context, []byte) ([][]byte, error) {
+	return nil, nil
+}
+
+func TestNewDoesNotLoadStatsDuringConstruction(t *testing.T) {
+	t.Parallel()
+
+	app := &config.App{}
+	app.Scrape.Interval = timeutil.Duration(time.Hour)
+	app.Scrape.Sources = []config.ScrapeSource{
+		{
+			Name: "test-source",
+			RSS: &config.ScrapeSourceRSS{
+				URL: "https://example.com/feed.xml",
+			},
+		},
+	}
+
+	store := stats.New(&panicKV{})
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("unexpected panic during scrape manager construction: %v", r)
+		}
+	}()
+
+	manager, err := NewFactory().New(component.Global, app, Dependencies{
+		ScraperFactory: scraper.NewFactory(),
+		Stats:          store,
+	})
+	if err != nil {
+		t.Fatalf("new scrape manager: %v", err)
+	}
+	if manager == nil {
+		t.Fatal("manager is nil")
+	}
+}
+
 // import (
 // 	"testing"
 // 	"time"
