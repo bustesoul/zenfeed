@@ -86,6 +86,7 @@ type ArchiveIndexEntry struct {
 	FeedID     string    `json:"feed_id"`
 	Title      string    `json:"title,omitempty"`
 	Source     string    `json:"source,omitempty"`
+	URL        string    `json:"url,omitempty"`
 	ArchivedAt time.Time `json:"archived_at"`
 }
 
@@ -195,6 +196,7 @@ func (s *Store) SaveArchive(ctx context.Context, entry *ArchiveEntry) error {
 		FeedID:     entry.FeedID,
 		Title:      entry.Labels["title"],
 		Source:     entry.Labels["source"],
+		URL:        entry.Labels["link"],
 		ArchivedAt: entry.ArchivedAt,
 	}
 	profile.ArchiveIndex = upsertArchiveIndex(profile.ArchiveIndex, indexEntry)

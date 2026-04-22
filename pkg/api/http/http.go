@@ -103,6 +103,7 @@ func new(instance string, app *config.App, dependencies Dependencies) (Server, e
 	protected.Handle("/get_profile", jsonrpc.API(api.GetProfile))
 	protected.Handle("/list_reads", jsonrpc.API(api.ListReads))
 	protected.Handle("/list_archives", jsonrpc.API(api.ListArchives))
+	protected.Handle("/get_archive", jsonrpc.API(api.GetArchive))
 	protected.Handle("/reset_profile", jsonrpc.API(api.ResetProfile))
 	protected.Handle("/get_stats", jsonrpc.API(api.GetStats))
 	router := http.NewServeMux()

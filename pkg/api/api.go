@@ -75,6 +75,7 @@ type API interface {
 	GetProfile(ctx context.Context, req *GetProfileRequest) (resp *GetProfileResponse, err error)
 	ListReads(ctx context.Context, req *ListReadsRequest) (resp *ListReadsResponse, err error)
 	ListArchives(ctx context.Context, req *ListArchivesRequest) (resp *ListArchivesResponse, err error)
+	GetArchive(ctx context.Context, req *GetArchiveRequest) (resp *GetArchiveResponse, err error)
 	ResetProfile(ctx context.Context, req *ResetProfileRequest) (resp *ResetProfileResponse, err error)
 	GetStats(ctx context.Context, req *GetStatsRequest) (resp *GetStatsResponse, err error)
 }
@@ -288,6 +289,17 @@ type ListArchivesRequest struct{}
 type ListArchivesResponse struct {
 	Archives []personalization.ArchiveIndexEntry `json:"archives"`
 	Total    int                                 `json:"total"`
+}
+
+type GetArchiveRequest struct {
+	FeedID string `json:"feed_id"`
+}
+
+type GetArchiveResponse struct {
+	FeedID     string            `json:"feed_id"`
+	Labels     map[string]string `json:"labels"`
+	FeedTime   time.Time         `json:"feed_time"`
+	ArchivedAt time.Time         `json:"archived_at"`
 }
 
 type ResetProfileRequest struct{}
@@ -933,6 +945,26 @@ func (a *api) ListArchives(ctx context.Context, _ *ListArchivesRequest) (*ListAr
 	return &ListArchivesResponse{Archives: archives, Total: len(archives)}, nil
 }
 
+func (a *api) GetArchive(ctx context.Context, req *GetArchiveRequest) (*GetArchiveResponse, error) {
+	if req.FeedID == "" {
+		return nil, ErrBadRequest(errors.New("feed_id is required"))
+	}
+
+	store := personalization.NewStore(a.Dependencies().KVStorage)
+
+	entry, err := store.GetArchive(ctx, req.FeedID)
+	if err != nil {
+		return nil, ErrInternal(errors.Wrap(err, "get archive entry"))
+	}
+
+	return &GetArchiveResponse{
+		FeedID:     entry.FeedID,
+		Labels:     entry.Labels,
+		FeedTime:   entry.FeedTime,
+		ArchivedAt: entry.ArchivedAt,
+	}, nil
+}
+
 func (a *api) ResetProfile(ctx context.Context, _ *ResetProfileRequest) (*ResetProfileResponse, error) {
 	store := personalization.NewStore(a.Dependencies().KVStorage)
 
@@ -1317,6 +1349,12 @@ func (m *mockAPI) ListArchives(ctx context.Context, req *ListArchivesRequest) (*
 	args := m.Called(ctx, req)
 
 	return args.Get(0).(*ListArchivesResponse), args.Error(1)
+}
+
+func (m *mockAPI) GetArchive(ctx context.Context, req *GetArchiveRequest) (*GetArchiveResponse, error) {
+	args := m.Called(ctx, req)
+
+	return args.Get(0).(*GetArchiveResponse), args.Error(1)
 }
 
 func (m *mockAPI) ResetProfile(ctx context.Context, req *ResetProfileRequest) (*ResetProfileResponse, error) {
